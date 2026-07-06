@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hfss-harness"
+version = "0.1.0"
+description = "HFSS/AEDT workflow harness for optimization, sweeps, validation, and dashboards."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "MIT" }
+authors = [
+  { name = "fangzh" },
+]
+keywords = ["hfss", "aedt", "pyaedt", "optimization", "simulation", "dashboard"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering",
+]
+dependencies = [
+  "matplotlib>=3.9,<4",
+  "numpy>=2,<3",
+  "scikit-learn>=1.6,<2",
+]
+
+[project.urls]
+Homepage = "https://github.com/fangzh5/hfss-harness"
+Repository = "https://github.com/fangzh5/hfss-harness"
+Issues = "https://github.com/fangzh5/hfss-harness/issues"
+
+[project.optional-dependencies]
+bo = [
+  "botorch>=0.17,<0.18",
+]
+cmaes = [
+  "cma>=4,<5",
+]
+hfss = [
+  "pyaedt>=0.18,<0.19",
+]
+legacy = [
+  "pandas>=2.2,<3",
+  "scipy>=1.15,<2",
+]
+dev = [
+  "pytest>=8.3,<9",
+]
+
+[project.scripts]
+hfss-harness = "optimizer.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["optimizer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

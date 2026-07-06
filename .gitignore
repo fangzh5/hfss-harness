@@ -1,0 +1,122 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+.python-version
+.pytest_cache/
+pytest-of-PC/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+.hfss_rebuild_venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.lnk
+.vscode/
+.idea/
+
+# Logs
+*.log
+batch.log
+
+# Local run outputs
+.worktrees/
+runs/
+temp/
+tmp/
+.agents/
+.packages/
+.pytest_tmp_autovia/
+pytest-of-PC/
+aedt_grpc.lock
+*.zip
+
+# Configs: keep only the shared templates
+configs/**
+!configs/
+!configs/template_opt.json
+!configs/template_sweep.json
+!configs/template_val.json
+!configs/template_bo.json
+!configs/template_cmaes.json
+!configs/example_patch_opt.json
+
+# Docs: keep only the shared agent reference
+docs/**
+!docs/
+!docs/agent-reference.md
+!docs/assets/
+!docs/assets/example_patch_opt_dashboard_target_reached.png
+
+# Local-only ad hoc tests and helper scripts
+optimizer/configs/
+tests/local_*.py
+tests/manual_*.py
+tests/scratch_*.py
+tests/tmp_*.py
+scripts/local_*.py
+scripts/manual_*.py
+scripts/scratch_*.py
+scripts/tmp_*.py
+scripts/*.local.py
+scripts/*.scratch.py
+
+# HFSS and simulation workspaces stay local, except the public minimal example
+hfss/*
+!hfss/patch.aedt
+runs/
+temp/
+data/
+
+# AEDT / HFSS generated artifacts
+*.aedtresults/
+*.aedtresults.bak_*/
+
+# Misc local scratch files
+*.tmp
+*.bak
+!.python-version
+
+# Public snapshot exclusions
+README.previous.md
+open_source_*.md
+docs/superpowers/
+scripts/
+optimizer/fabrication/
+optimizer/legacy/
+optimizer/README.md
+optimizer/run_optimizer.py
+optimizer/dashboard/README.md
+optimizer/dashboard/demo_state.json
+optimizer/dashboard/layout_options.*
+optimizer/dashboard/style_options.*
+optimizer/dashboard/verification_*.png
+tests/test_create_me_dipole_bf33.py
+tests/test_create_vias_from_path_config.py
+tests/test_drill_stackup_write.py
+tests/test_export_hfss_fabrication_package.py
+tests/test_fabrication_model.py
+tests/test_gerber_write.py
+tests/test_kicad_source_export.py
+tests/test_layer_build.py
+tests/test_legacy_hfss_connector.py
+tests/test_package_check.py
+tests/test_rebuild_hfss_from_fabrication.py
+# Public skill allowlist: keep only hh-sim and hh-iter in the first public snapshot
+.codex/skills/*
+!.codex/skills/hh-sim/
+!.codex/skills/hh-sim/**
+!.codex/skills/hh-iter/
+!.codex/skills/hh-iter/**

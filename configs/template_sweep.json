@@ -1,0 +1,52 @@
+{
+  "name": "template_sweep",
+  "task_type": "sweep",
+  "optimization": {
+    "work_dir": "../temp",
+    "save_best_on_exit": false,
+    "save_interval": 1
+  },
+  "launch": {
+    "dashboard": true,
+    "dashboard_browser": true,
+    "silent": false,
+    "dashboard_port": 8765
+  },
+  "study": {
+    "freq_band": [
+      55,
+      66
+    ],
+    "s11_threshold": -10,
+    "variables": [
+      {
+        "name": "patch_x",
+        "start": 0.9,
+        "stop": 1.0,
+        "step": 0.01
+      }
+    ]
+  },
+  "simulator": {
+    "hfss": {
+      "project_path": "../hfss/patch.aedt",
+      "design_name": "base",
+      "setup_name": "Setup1",
+      "sweep_name": "Sweep",
+      "new_desktop": true,
+      "non_graphical": true,
+      "close_projects": 0,
+      "close_desktop": 0,
+      "results": {
+        "s11": "dB(S(1,1))",
+        "freq_unit": "GHz"
+      }
+    }
+  },
+  "output": {
+    "save_data": true,
+    "raw_data_format": "jsonl",
+    "output_dir": "../runs",
+    "plot_s11": true
+  }
+}

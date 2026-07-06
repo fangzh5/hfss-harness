@@ -1,0 +1,82 @@
+{
+  "name": "template_bo",
+  "task_type": "opt",
+  "optimization": {
+    "work_dir": "../temp",
+    "project_suffix": "_work",
+    "save_best_on_exit": true,
+    "save_interval": 1,
+    "initial_point": [
+      1.01,
+      0.25
+    ]
+  },
+  "launch": {
+    "dashboard": true,
+    "dashboard_browser": true,
+    "silent": false,
+    "dashboard_port": 8765
+  },
+  "parameters": [
+    {
+      "name": "patch_w",
+      "min": 0.8585,
+      "max": 1.1615,
+      "unit": "mm",
+      "resolution": 0.01
+    },
+    {
+      "name": "probe_p",
+      "min": 0.1,
+      "max": 0.58075,
+      "unit": "mm",
+      "resolution": 0.01,
+      "constraint": "probe_p <= patch_w / 2"
+    }
+  ],
+  "target": {
+    "freq_band": [
+      59,
+      61
+    ],
+    "s11_threshold": -15,
+    "bandwidth_target": null,
+    "gain_min": null
+  },
+  "algorithm": {
+    "method": "bo",
+    "strategy": "tr",
+    "n_initial": 6,
+    "acquisition": "log_ei",
+    "raw_samples": 128,
+    "num_restarts": 8,
+    "max_iterations": 30,
+    "early_stop_patience": 10,
+    "max_simulations": 30
+  },
+  "history": {
+    "mode": "off",
+    "sources": []
+  },
+  "simulator": {
+    "hfss": {
+      "project_path": "../hfss/patch.aedt",
+      "design_name": "base",
+      "setup_name": "Setup1",
+      "sweep_name": "Sweep",
+      "new_desktop": true,
+      "non_graphical": true,
+      "close_projects": 0,
+      "close_desktop": 0,
+      "results": {
+        "s11": "dB(S(1,1))",
+        "freq_unit": "GHz"
+      }
+    }
+  },
+  "output": {
+    "save_csv": true,
+    "output_dir": "../runs",
+    "plot_s11": true
+  }
+}

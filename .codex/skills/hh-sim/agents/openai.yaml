@@ -1,0 +1,6 @@
+﻿interface:
+  display_name: "HFSS Harness Sim"
+  short_description: "Create HFSS opt/sweep/val configs and require launch confirmation"
+  default_prompt: "Use $hh-sim to create an opt, sweep, or val config for a specific .aedt project, then stop before launch and confirm parameter ranges, target, algorithm, and end time."
+
+

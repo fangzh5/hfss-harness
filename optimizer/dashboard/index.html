@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Optimization Dashboard</title>
+  <script>
+    (function () {
+      const storageKey = "optimizer-dashboard-theme-preference";
+      const query = new URLSearchParams(window.location.search);
+      const queryTheme = query.get("theme");
+      const systemPrefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      let preference = "auto";
+      if (queryTheme === "light" || queryTheme === "dark") {
+        preference = queryTheme;
+      }
+      try {
+        const stored = window.localStorage.getItem(storageKey);
+        if (preference === "auto" && (stored === "light" || stored === "dark" || stored === "auto")) {
+          preference = stored;
+        }
+      } catch (error) {
+        preference = "auto";
+      }
+      const theme = preference === "light" || preference === "dark"
+        ? preference
+        : (systemPrefersDark ? "dark" : "light");
+      document.documentElement.dataset.theme = theme;
+      document.documentElement.dataset.themePreference = preference;
+    })();
+  </script>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="bg-orb bg-orb-a"></div>
+  <div class="bg-orb bg-orb-b"></div>
+
+  <main class="dashboard-shell">
+    <header class="hero card">
+      <div class="hero-copy">
+        <div class="eyebrow">Standalone module</div>
+        <h1>仿真优化看板</h1>
+        <p class="hero-desc" id="dashboard-meta"></p>
+      </div>
+
+      <div class="hero-meta">
+        <div class="meta-pill" id="run-mode-pill">Static preview</div>
+        <div class="meta-subtitle" id="run-subtitle">静态布局预览，可切换到 Static JSON 或 Live polling</div>
+      </div>
+    </header>
+
+    <section class="summary-grid" id="summary-grid" aria-label="run summary"></section>
+
+    <section class="main-grid">
+      <section class="stack stack-left chart-stack">
+        <section class="panel card panel-wide">
+          <div class="panel-head">
+            <div>
+              <div class="panel-kicker">趋势图</div>
+              <h2 id="trend-panel-title">Fitness 随仿真次数变化</h2>
+            </div>
+            <div class="panel-note" id="trend-panel-note">单目标显示累计 best-so-far，多目标显示 Pareto front。</div>
+          </div>
+          <div class="chart-shell">
+            <div id="fitness-chart"></div>
+          </div>
+        </section>
+
+        <section class="panel card panel-wide">
+          <div class="panel-head">
+            <div>
+              <div class="panel-kicker">结果曲线</div>
+              <h2 id="curve-panel-title">关键 S 参数对比</h2>
+            </div>
+            <div class="panel-note" id="curve-panel-note">根据快照中可用的曲线自动收缩布局。</div>
+          </div>
+          <div class="curve-grid" id="curve-grid"></div>
+        </section>
+      </section>
+
+      <aside class="stack stack-right info-stack">
+        <section class="panel card panel-wide">
+          <div class="panel-head">
+            <div>
+              <div class="panel-kicker">参数视图</div>
+              <h2>动态参数列表</h2>
+            </div>
+            <div class="panel-note">VALUE 表示当前值，STATE 表示该参数是否参与优化。</div>
+          </div>
+          <div class="table-wrap">
+            <table class="param-table" id="param-table"></table>
+          </div>
+          <div class="param-legend">ACTIVE 表示参与优化并随算法更新，FIXED / INACTIVE 仅展示，不参与搜索。</div>
+        </section>
+
+        <section class="panel card panel-wide event-panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-kicker">运行日志</div>
+              <h2>最近事件</h2>
+            </div>
+          </div>
+          <div class="event-list" id="event-list"></div>
+        </section>
+      </aside>
+    </section>
+  </main>
+
+  <button
+    type="button"
+    class="theme-toggle"
+    id="theme-toggle"
+    data-theme-toggle="1"
+    aria-label="切换日间和夜间主题"
+    aria-pressed="false"
+  >
+    <span class="theme-toggle__label">主题</span>
+    <span class="theme-toggle__state" id="theme-toggle-state">自动</span>
+  </button>
+
+  <script src="./dashboard.js"></script>
+</body>
+</html>
