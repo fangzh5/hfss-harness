@@ -1,9 +1,12 @@
 """Parameter management helpers for the optimizer."""
 
 from dataclasses import dataclass
+import math
 from typing import List, Optional, Tuple
 
 import numpy as np
+
+from .constraints import Constraint
 
 
 @dataclass
@@ -47,6 +50,12 @@ class ParameterManager:
     def __init__(self, param_configs: List[dict]):
         self.parameters = self._parse_configs(param_configs)
         self._param_dict = {p.name: p for p in self.parameters}
+        if len(self._param_dict) != len(self.parameters):
+            raise ValueError("Parameter names must be unique")
+        self._constraints = {
+            p.constraint: Constraint(p.constraint, self.get_param_names())
+            for p in self.parameters if p.constraint
+        }
 
     def _parse_configs(self, configs: List[dict]) -> List[Parameter]:
         params = []
@@ -63,7 +72,36 @@ class ParameterManager:
                 constraint=cfg.get("constraint"),
             )
             params.append(param)
+            if not all(math.isfinite(float(v)) for v in (param.min_val, param.max_val)):
+                raise ValueError(f"{param.name}: bounds must be finite")
+            if param.min_val > param.max_val:
+                raise ValueError(f"{param.name}: min must not exceed max")
+            if param.mode not in {"step", "count"}:
+                raise ValueError(f"{param.name}: unsupported grid mode {param.mode!r}")
+            if param.mode == "count" and (
+                type(param.count) is not int or param.count < 1
+            ):
+                raise ValueError(f"{param.name}: count must be a positive integer")
+            if param.resolution is not None:
+                if not math.isfinite(float(param.resolution)) or param.resolution < 0:
+                    raise ValueError(f"{param.name}: resolution must be finite and nonnegative")
+                if param.resolution:
+                    self._resolution_limits(param)
         return params
+
+    @staticmethod
+    def _resolution_limits(parameter):
+        lower = math.ceil(parameter.min_val / parameter.resolution - 1e-10)
+        upper = math.floor(parameter.max_val / parameter.resolution + 1e-10)
+        if lower > upper:
+            raise ValueError(f"{parameter.name}: no manufacturing grid point inside bounds")
+        return lower, upper
+
+    def _vector(self, params):
+        values = np.asarray(params, dtype=float)
+        if values.shape != (self.n_params,) or not np.all(np.isfinite(values)):
+            raise ValueError(f"Expected {self.n_params} finite parameter values")
+        return values
 
     def discretize(
         self,
@@ -73,6 +111,7 @@ class ParameterManager:
         include_resolution: bool = True,
     ) -> np.ndarray:
         """Snap values to the configured grid."""
+        params = self._vector(params)
         result = np.zeros_like(params, dtype=float)
         for i, p in enumerate(self.parameters):
             value = float(params[i])
@@ -82,13 +121,15 @@ class ParameterManager:
                 else:
                     grid = np.linspace(p.min_val, p.max_val, int(p.count))
                     value = float(grid[int(np.argmin(np.abs(grid - value)))])
-            if include_resolution and p.resolution:
-                value = np.round(value / p.resolution) * p.resolution
+            elif include_resolution and p.resolution:
+                lower, upper = self._resolution_limits(p)
+                value = np.clip(np.round(value / p.resolution), lower, upper) * p.resolution
             result[i] = value
         return result
 
     def clamp(self, params: np.ndarray) -> np.ndarray:
         """Clamp values to bounds."""
+        params = self._vector(params)
         result = np.zeros_like(params, dtype=float)
         for i, p in enumerate(self.parameters):
             result[i] = np.clip(params[i], p.min_val, p.max_val)
@@ -125,6 +166,12 @@ class ParameterManager:
 
     def check_constraints(self, params: np.ndarray) -> bool:
         """Check constraint expressions."""
+        try:
+            params = np.asarray(params, dtype=float)
+        except (TypeError, ValueError):
+            return False
+        if params.shape != (self.n_params,) or not np.all(np.isfinite(params)):
+            return False
         for p in self.parameters:
             if p.constraint and not self._eval_constraint(p.constraint, params):
                 return False
@@ -162,14 +209,15 @@ class ParameterManager:
         return np.array([float(parameter.min_val), float(parameter.max_val)], dtype=float)
 
     def _eval_constraint(self, constraint_expr: str, params: np.ndarray) -> bool:
-        """Evaluate a constraint expression."""
+        """Evaluate validated numerical constraints, rejecting invalid vectors."""
         try:
-            expr = constraint_expr
-            for i, p in enumerate(self.parameters):
-                expr = expr.replace(p.name, f"params[{i}]")
-            return bool(eval(expr))
-        except Exception:
-            return True
+            values = np.asarray(params, dtype=float)
+            if values.shape != (self.n_params,):
+                return False
+            return self._constraints[constraint_expr].evaluate(
+                dict(zip(self.get_param_names(), values)))
+        except (ValueError, TypeError, KeyError):
+            return False
 
     def get_step_size(self) -> np.ndarray:
         """Get the current step-size vector."""

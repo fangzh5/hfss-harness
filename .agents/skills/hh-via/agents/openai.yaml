@@ -1,0 +1,4 @@
+﻿interface:
+  display_name: "HFSS Harness Via"
+  short_description: "Create and verify parameterized HFSS via arrays safely"
+  default_prompt: "Use $hh-via to plan and verify a parameterized via array in an isolated work model, reuse confirmed inputs, record results in runs/autovia, and follow the requested save/close behavior."

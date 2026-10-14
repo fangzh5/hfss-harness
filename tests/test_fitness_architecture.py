@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
 
 
 from optimizer.core.fitness import FitnessCalculator
+from optimizer.metrics import _target_requires_far_field_metrics
 
 
 def _make_calculator(single_objective_strategy: str) -> FitnessCalculator:
@@ -105,3 +106,93 @@ def test_calculate_multiobjective_uses_shared_nsga2_packaging_with_scalar_constr
     }
     assert result.constraint_violation == pytest.approx(12.0)
     assert result.cost == pytest.approx(15.8)
+
+def test_multiobjective_boresight_gain_target_abs_uses_boresight_gain_series():
+    calc = FitnessCalculator(
+        freq_band=(26.0, 38.0),
+        s11_target=-11.0,
+        objective_mode="algorithm_aware",
+        fitness_config={"single_objective_strategy": "legacy"},
+        multi_objective_config={
+            "enabled": True,
+            "objectives": [
+                {
+                    "name": "boresight_dir_total_target_abs",
+                    "type": "boresight_gain_target_abs",
+                    "target": 6.0,
+                },
+            ],
+        },
+    )
+    freqs = np.array([26.0, 32.0, 38.0], dtype=float)
+    s11 = np.array([-12.0, -13.0, -11.5], dtype=float)
+    extra_metrics = {
+        "far_field": {
+            "per_frequency": [
+                {"boresight_grid_point": {"gain_db": 5.0}},
+                {"boresight_grid_point": {"gain_db": 6.5}},
+                {"boresight_grid_point": {"gain_db": 7.0}},
+            ]
+        }
+    }
+
+    result = calc.calculate_multiobjective(freqs, s11, extra_metrics=extra_metrics)
+
+    assert result.constraint_violation == pytest.approx(0.0)
+    assert result.objectives == pytest.approx([(1.0 + 0.5 + 1.0) / 3.0])
+    assert result.extra_metrics["objective_metrics"]["boresight_dir_total_target_abs"] == pytest.approx(
+        (1.0 + 0.5 + 1.0) / 3.0
+    )
+
+
+def test_multiobjective_boresight_gain_window_is_a_hard_constraint():
+    calc = FitnessCalculator(
+        freq_band=(26.0, 28.0),
+        s11_target=-10.0,
+        objective_mode="algorithm_aware",
+        fitness_config={"single_objective_strategy": "legacy"},
+        multi_objective_config={
+            "enabled": True,
+            "objectives": [
+                {
+                    "name": "J_gain",
+                    "type": "boresight_gain_worst_target_abs",
+                    "target": 5.5,
+                    "constraint_max": 0.5,
+                },
+            ],
+        },
+    )
+    freqs = np.array([26.0, 27.0, 28.0], dtype=float)
+    s11 = np.array([-12.0, -12.5, -11.0], dtype=float)
+    extra_metrics = {
+        "far_field": {
+            "per_frequency": [
+                {"boresight_grid_point": {"gain_db": 5.0}},
+                {"boresight_grid_point": {"gain_db": 5.5}},
+                {"boresight_grid_point": {"gain_db": 6.2}},
+            ]
+        }
+    }
+
+    result = calc.calculate_multiobjective(freqs, s11, extra_metrics=extra_metrics)
+
+    assert result.objectives == pytest.approx([0.7])
+    assert result.extra_metrics["constraint_details"]["J_gain_violation"] == pytest.approx(0.2)
+    assert result.constraint_violation == pytest.approx(0.2)
+    assert result.stage_met is False
+
+
+def test_boresight_gain_target_abs_objective_requires_far_field_metrics():
+    config = {
+        "target": {
+            "multi_objective": {
+                "enabled": True,
+                "objectives": [
+                    {"name": "boresight_dir_total_target_abs", "type": "boresight_gain_target_abs"}
+                ],
+            }
+        }
+    }
+
+    assert _target_requires_far_field_metrics(config) is True

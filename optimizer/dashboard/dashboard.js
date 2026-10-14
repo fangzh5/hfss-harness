@@ -730,7 +730,7 @@
           return null;
         }
         const objectives = normalizeObjectiveList(point.objectives);
-        if (objectives.length < 2) {
+        if (objectives.length < 1) {
           return null;
         }
         return {
@@ -986,6 +986,28 @@
     return state?.optimization_mode === "multi_objective";
   }
 
+  function getObjectiveDefinitions(state) {
+    const definitions = state?.target?.multi_objective?.objectives;
+    return Array.isArray(definitions) ? definitions.filter((item) => isPlainObject(item)) : [];
+  }
+
+  function getObjectiveLabel(state, index) {
+    const definition = getObjectiveDefinitions(state)[index];
+    return definition?.name || definition?.type || `objective_${index + 1}`;
+  }
+
+  function getObjectiveCount(state) {
+    const definitionCount = getObjectiveDefinitions(state).length;
+    const currentCount = Array.isArray(state?.current?.objectives) ? state.current.objectives.length : 0;
+    const historyCount = Array.isArray(state?.fitnessHistory)
+      ? state.fitnessHistory.reduce(
+          (count, item) => Math.max(count, Array.isArray(item?.objectives) ? item.objectives.length : 0),
+          0,
+        )
+      : 0;
+    return Math.max(definitionCount, currentCount, historyCount);
+  }
+
   function getCurrentPeakLossMetric(state) {
     const worst = state?.current?.extra_metrics?.far_field?.summary?.worst_peak_loss_db;
     const freq = state?.current?.extra_metrics?.far_field?.summary?.worst_peak_loss_frequency;
@@ -1203,6 +1225,12 @@
     const secondarySignalLabel = signalLabel(s12Curves.valueKey);
     const peakLossThreshold = state.target?.multi_objective?.peak_loss_threshold;
     const currentObjectives = Array.isArray(state.current?.objectives) ? state.current.objectives : [];
+    const objectiveSummaryRows = Array.from({ length: getObjectiveCount(state) }, (_, index) => renderSummaryRow({
+      label: getObjectiveLabel(state, index),
+      meta: `representative ${getObjectiveLabel(state, index)}`,
+      value: formatNumber(currentObjectives[index], 3),
+      valueClass: "mono",
+    })).join("");
     const currentPeakLoss = getCurrentPeakLossMetric(state);
     const currentPointingError = getCurrentPointingErrorMetric(state);
     const frontSize = getParetoFrontSize(state);
@@ -1436,18 +1464,7 @@
               value: formatNumber(state.current?.constraint_violation, 4),
               valueClass: "mono",
             })}
-            ${renderSummaryRow({
-              label: "objective_1",
-              meta: "representative objective_1",
-              value: formatNumber(currentObjectives[0], 3),
-              valueClass: "mono",
-            })}
-            ${renderSummaryRow({
-              label: "objective_2",
-              meta: "representative objective_2",
-              value: formatNumber(currentObjectives[1], 3),
-              valueClass: "mono",
-            })}
+            ${objectiveSummaryRows}
             ${renderSummaryRow({
               label: "最差 S11",
               meta: bestWorstS11.note,
@@ -1724,6 +1741,13 @@
     const lastSimRuntime = runtime.last_sim_runtime_display || "N/A";
     const totalRuntime = runtime.total_runtime_display || current.elapsed || "N/A";
     if (multiObjective) {
+      const objectiveCount = getObjectiveCount(state);
+      const objectiveRows = Array.from({ length: objectiveCount }, (_, index) => `
+        <div class="kv-row">
+          <div class="kv-label">${escapeHtml(getObjectiveLabel(state, index))}</div>
+          <div class="kv-value mono">${escapeHtml(formatNumber(objectives[index], 4))}</div>
+        </div>
+      `).join("");
       stack.innerHTML = `
         <div class="kv-row">
           <div class="kv-label">Pareto front</div>
@@ -1733,14 +1757,7 @@
           <div class="kv-label">constraint</div>
           <div class="kv-value mono">${escapeHtml(formatNumber(current.constraint_violation, 4))}</div>
         </div>
-        <div class="kv-row">
-          <div class="kv-label">objective_1</div>
-          <div class="kv-value mono">${escapeHtml(formatNumber(objectives[0], 4))}</div>
-        </div>
-        <div class="kv-row">
-          <div class="kv-label">objective_2</div>
-          <div class="kv-value mono">${escapeHtml(formatNumber(objectives[1], 4))}</div>
-        </div>
+        ${objectiveRows}
         <div class="kv-row">
           <div class="kv-label">本次仿真</div>
           <div class="kv-value mono">${escapeHtml(lastSimRuntime)}</div>
@@ -2267,7 +2284,11 @@
 
   function renderChart(state) {
     if (isMultiObjective(state)) {
-      renderParetoChart(state);
+      if (getObjectiveCount(state) <= 1) {
+        renderSingleObjectiveParetoChart(state);
+      } else {
+        renderParetoChart(state);
+      }
       return;
     }
     const container = document.getElementById("fitness-chart");
@@ -2436,6 +2457,178 @@
     container.appendChild(svg);
   }
 
+  function buildSingleObjectiveParetoSeries(history) {
+    const items = Array.isArray(history) ? history : [];
+    const normalized = items
+      .map((point, index) => {
+        const simId = toFiniteNumber(point?.sim_id ?? index + 1);
+        const objective = toFiniteNumber(point?.objectives?.[0]);
+        const violation = toFiniteNumber(point?.constraint_violation);
+        if (simId === null || objective === null) {
+          return null;
+        }
+        return {
+          ...point,
+          sim_id: simId,
+          objective,
+          constraint_violation: violation,
+          feasible: violation !== null && violation <= 1e-12,
+          _order: index,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.sim_id - b.sim_id || a._order - b._order);
+
+    let bestFeasible = null;
+    return normalized.map((point) => {
+      if (point.feasible) {
+        bestFeasible = bestFeasible === null ? point.objective : Math.min(bestFeasible, point.objective);
+      }
+      return { ...point, bestFeasible };
+    });
+  }
+
+  function renderSingleObjectiveParetoChart(state) {
+    const container = document.getElementById("fitness-chart");
+    const series = buildSingleObjectiveParetoSeries(state.fitnessHistory);
+    if (!series.length) {
+      container.innerHTML = '<div class="chart-empty">暂无 objective 历史数据</div>';
+      return;
+    }
+
+    const width = 1100;
+    const height = 420;
+    const padding = { left: 78, right: 30, top: 28, bottom: 58 };
+    const plotWidth = width - padding.left - padding.right;
+    const plotHeight = height - padding.top - padding.bottom;
+    const axisLabelColor = themeColor("--chart-axis-text", "#a9949b");
+    const objectiveValues = series.map((point) => point.objective);
+    const bestValues = series.map((point) => point.bestFeasible).filter((value) => value !== null);
+    const values = objectiveValues.concat(bestValues);
+    const minY = Math.min(...values);
+    const maxY = Math.max(...values);
+    const yPad = Math.max((maxY - minY) * 0.18, 0.05);
+    const yMin = minY - yPad;
+    const yMax = maxY + yPad;
+    const yRange = yMax - yMin || 1;
+    const xMin = series[0].sim_id;
+    const xMax = series[series.length - 1].sim_id;
+    const xRange = xMax - xMin || 1;
+    const xFor = (simId) => padding.left + ((simId - xMin) / xRange) * plotWidth;
+    const yFor = (value) => padding.top + ((yMax - value) / yRange) * plotHeight;
+
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", `${getObjectiveLabel(state, 0)} Pareto evolution chart`);
+    svg.classList.add("fitness-svg");
+    svg.style.width = "100%";
+    svg.style.height = "auto";
+    svg.style.display = "block";
+
+    for (let i = 0; i <= 4; i += 1) {
+      const y = padding.top + (plotHeight / 4) * i;
+      svg.appendChild(createSvgNode("line", {
+        x1: padding.left,
+        x2: width - padding.right,
+        y1: y,
+        y2: y,
+        stroke: i === 4 ? themeColor("--chart-grid-strong", "rgba(255, 194, 148, 0.18)") : themeColor("--chart-grid-soft", "rgba(255, 194, 148, 0.08)"),
+        "stroke-dasharray": i === 4 ? "0" : "6 8",
+      }));
+    }
+
+    const frontPoints = series.filter((point) => point.bestFeasible !== null);
+    if (frontPoints.length) {
+      const frontPath = frontPoints
+        .map((point, index) => `${index === 0 ? "M" : "L"} ${xFor(point.sim_id)} ${yFor(point.bestFeasible)}`)
+        .join(" ");
+      svg.appendChild(createSvgNode("path", {
+        d: frontPath,
+        fill: "none",
+        stroke: themeColor("--chart-best-end", "#ff9b69"),
+        "stroke-width": "4",
+        "stroke-linecap": "round",
+        "stroke-linejoin": "round",
+      }));
+    }
+
+    series.forEach((point) => {
+      const current = point.sim_id === state.current?.sim_id;
+      svg.appendChild(createSvgNode("circle", {
+        cx: xFor(point.sim_id),
+        cy: yFor(point.objective),
+        r: current ? "6.5" : "4.5",
+        fill: point.feasible ? themeColor("--chart-highlight-fill", "#ffbf86") : "none",
+        stroke: point.feasible ? themeColor("--chart-highlight-stroke", "#ffbf86") : axisLabelColor,
+        "stroke-width": current ? "3" : "2",
+        opacity: point.feasible ? "1" : "0.58",
+      }));
+    });
+
+    buildAdaptiveXAxisTicks(xMin, xMax, plotWidth).forEach((value) => {
+      const x = xFor(value);
+      svg.appendChild(createSvgNode("line", {
+        x1: x,
+        x2: x,
+        y1: padding.top,
+        y2: height - padding.bottom,
+        stroke: themeColor("--chart-grid-vertical", "rgba(255, 153, 133, 0.06)"),
+        "stroke-dasharray": "4 8",
+      }));
+      const label = createSvgNode("text", {
+        x,
+        y: height - 18,
+        fill: axisLabelColor,
+        "font-size": "14",
+        "text-anchor": "middle",
+        "font-family": "Cascadia Mono, Consolas, monospace",
+      });
+      label.textContent = formatAxisTick(value);
+      svg.appendChild(label);
+    });
+
+    for (let i = 0; i <= 4; i += 1) {
+      const value = yMin + ((yMax - yMin) / 4) * i;
+      const label = createSvgNode("text", {
+        x: padding.left - 12,
+        y: yFor(value) + 4,
+        fill: axisLabelColor,
+        "font-size": "14",
+        "text-anchor": "end",
+        "font-family": "Cascadia Mono, Consolas, monospace",
+      });
+      label.textContent = formatNumber(value, 3);
+      svg.appendChild(label);
+    }
+
+    const xLabel = createSvgNode("text", {
+      x: width / 2,
+      y: height - 4,
+      fill: axisLabelColor,
+      "font-size": "14",
+      "text-anchor": "middle",
+      "font-family": "Cascadia Mono, Consolas, monospace",
+    });
+    xLabel.textContent = "Simulation";
+    svg.appendChild(xLabel);
+
+    const yLabel = createSvgNode("text", {
+      x: 22,
+      y: height / 2,
+      fill: axisLabelColor,
+      "font-size": "14",
+      "text-anchor": "middle",
+      "font-family": "Cascadia Mono, Consolas, monospace",
+      transform: `rotate(-90 22 ${height / 2})`,
+    });
+    yLabel.textContent = getObjectiveLabel(state, 0);
+    svg.appendChild(yLabel);
+
+    container.innerHTML = "";
+    container.appendChild(svg);
+  }
+
   function renderParetoChart(state) {
     const container = document.getElementById("fitness-chart");
     const points = Array.isArray(state.paretoFront) ? state.paretoFront : [];
@@ -2545,7 +2738,6 @@
       svg.appendChild(label);
     }
 
-    const objDefs = Array.isArray(state.target?.multi_objective?.objectives) ? state.target.multi_objective.objectives : [];
     const xLabel = createSvgNode("text", {
       x: width / 2,
       y: height - 4,
@@ -2554,7 +2746,7 @@
       "text-anchor": "middle",
       "font-family": "Cascadia Mono, Consolas, monospace",
     });
-    xLabel.textContent = objDefs[0]?.name || objDefs[0]?.type || "objective_1";
+    xLabel.textContent = getObjectiveLabel(state, 0);
     svg.appendChild(xLabel);
 
     const yLabel = createSvgNode("text", {
@@ -2566,7 +2758,7 @@
       "font-family": "Cascadia Mono, Consolas, monospace",
       transform: `rotate(-90 28 ${height / 2})`,
     });
-    yLabel.textContent = objDefs[1]?.name || objDefs[1]?.type || "objective_2";
+    yLabel.textContent = getObjectiveLabel(state, 1);
     svg.appendChild(yLabel);
 
     container.innerHTML = "";
@@ -2621,13 +2813,17 @@
     const curvePanelTitle = document.getElementById("curve-panel-title");
     const curvePanelNote = document.getElementById("curve-panel-note");
     if (trendTitle) {
+      const objectiveCount = getObjectiveCount(normalized);
       trendTitle.textContent = isMultiObjective(normalized)
-        ? "Pareto Front"
+        ? (objectiveCount <= 1 ? `${getObjectiveLabel(normalized, 0)} Front Evolution` : "Pareto Front")
         : (taskType === "sweep" ? "Sweep 指标趋势" : (taskType === "val" ? "Validation 指标趋势" : "Fitness 随仿真次数变化"));
     }
     if (trendNote) {
+      const objectiveCount = getObjectiveCount(normalized);
       trendNote.textContent = isMultiObjective(normalized)
-        ? "非支配解散点图。X/Y 轴对应当前配置的前两个 objective。"
+        ? (objectiveCount <= 1
+          ? "实心点满足硬约束，空心点违反约束；曲线为 best feasible so far。"
+          : "非支配解散点图。X/Y 轴对应当前配置的前两个 objective。")
         : (taskType === "sweep" ? "按仿真顺序显示 band max S11 的 best-so-far 曲线。" : (taskType === "val" ? "按案例顺序显示 cost 的 best-so-far 曲线。" : "累计 best-so-far 曲线。"));
     }
     if (curvePanelTitle) {
@@ -2805,4 +3001,3 @@
     renderDashboard(externalState || sampleState);
   });
 })();
-

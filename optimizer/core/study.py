@@ -3,24 +3,71 @@
 from __future__ import annotations
 
 from typing import Iterable, Sequence
+from decimal import Decimal
+import math
+import itertools
 
 import numpy as np
 
 
-def build_step_sweep_values(start: float, stop: float, step: float, digits: int = 4) -> list[float]:
+def build_step_sweep_values(start: float, stop: float, step: float, digits: int | None = None) -> list[float]:
     """Build an inclusive rounded sweep grid."""
+    if not all(math.isfinite(float(value)) for value in (start, stop, step)):
+        raise ValueError("Sweep values must be finite")
     if step <= 0:
         raise ValueError("step must be positive")
     if stop < start:
         raise ValueError("stop must be greater than or equal to start")
 
-    values: list[float] = []
-    current = float(start)
-    upper = float(stop) + 1e-9
-    while current <= upper:
-        values.append(round(current, digits))
-        current += step
-    return values
+    low, high, delta = (Decimal(str(value)) for value in (start, stop, step))
+    count = int((high - low) / delta) + 1
+    if count > 100000:
+        raise ValueError("Sweep grid exceeds 100000 points")
+    values = [float(low + index * delta) for index in range(count)]
+    return [round(value, digits) for value in values] if digits is not None else values
+
+
+def build_study_cases(study):
+    """Build bounded OAT, Cartesian grid or explicit cases before touching AEDT."""
+    mode = study.get("mode", "oat")
+    limit = study.get("max_cases", 100000)
+    if type(limit) is not int or not 1 <= limit <= 100000:
+        raise ValueError("study.max_cases must be an integer in 1..100000")
+    if mode == "explicit":
+        entries = study.get("cases")
+        if not isinstance(entries, list) or not entries or len(entries) > limit:
+            raise ValueError("Explicit study requires cases within max_cases")
+        cases = []
+        for index, case in enumerate(entries, 1):
+            if not isinstance(case, dict):
+                raise ValueError("Explicit cases must be objects")
+            values = case.get("params", {k: v for k, v in case.items() if k != "name"})
+            if not isinstance(values, dict) or not values:
+                raise ValueError("Explicit cases require parameter values")
+            cases.append({"params": dict(values), "variable": "explicit", "value": index,
+                          "case_name": case.get("name", f"case_{index:03d}"),
+                          "variable_index": 1, "point_index": index, "point_count": len(entries)})
+        return cases
+    if mode not in {"oat", "grid"}:
+        raise ValueError("study.mode must be oat, grid or explicit")
+    variables = study.get("variables")
+    if not isinstance(variables, list) or not variables:
+        raise ValueError("Study requires at least one variable")
+    names = [str(variable["name"]) for variable in variables]
+    if len(set(names)) != len(names):
+        raise ValueError("Study variable names must be unique")
+    grids = [build_step_sweep_values(v["start"], v["stop"], v["step"]) for v in variables]
+    count = sum(map(len, grids)) if mode == "oat" else math.prod(map(len, grids))
+    if count > limit:
+        raise ValueError("Study exceeds configured max_cases")
+    if mode == "grid":
+        return [{"params": dict(zip(names, point)), "variable": "grid", "value": index,
+                 "variable_index": 1, "point_index": index, "point_count": count}
+                for index, point in enumerate(itertools.product(*grids), 1)]
+    return [{"params": {name: value}, "variable": name, "value": value,
+             "variable_index": vi, "point_index": pi, "point_count": len(grid)}
+            for vi, (name, grid) in enumerate(zip(names, grids), 1)
+            for pi, value in enumerate(grid, 1)]
 
 
 def summarize_sparameter_band(

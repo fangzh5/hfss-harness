@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hfss-harness"
-version = "0.1.0"
+version = "0.2.0"
 description = "HFSS/AEDT workflow harness for optimization, sweeps, validation, and dashboards."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -35,6 +35,11 @@ Repository = "https://github.com/fangzh5/hfss-harness"
 Issues = "https://github.com/fangzh5/hfss-harness/issues"
 
 [project.optional-dependencies]
+cam = [
+  "gerbonara==1.5.0; python_version < '3.12'",
+  "gerbonara==1.6.3; python_version >= '3.12'",
+  "shapely>=2.1,<2.2",
+]
 bo = [
   "botorch>=0.17,<0.18",
 ]
@@ -57,7 +62,47 @@ hfss-harness = "optimizer.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["optimizer"]
+ignore-vcs = true
+exclude = ["**/__pycache__/**", "**/*.pyc", "optimizer/legacy/**", "optimizer/configs/**", "optimizer/README.md",
+           "optimizer/dashboard/README.md", "optimizer/dashboard/demo_state.json",
+           "optimizer/dashboard/layout_options*", "optimizer/dashboard/style_options*",
+           "optimizer/dashboard/verification*.png"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"AGENT.md" = "optimizer/_resources/AGENT.md"
+"scripts/create_vias_safely.py" = "optimizer/_resources/scripts/create_vias_safely.py"
+"hfss/patch.aedt" = "optimizer/_resources/hfss/patch.aedt"
+"configs/template_opt.json" = "optimizer/_resources/configs/template_opt.json"
+"configs/template_sweep.json" = "optimizer/_resources/configs/template_sweep.json"
+"configs/template_val.json" = "optimizer/_resources/configs/template_val.json"
+"configs/template_bo.json" = "optimizer/_resources/configs/template_bo.json"
+"configs/template_cmaes.json" = "optimizer/_resources/configs/template_cmaes.json"
+"configs/example_patch_opt.json" = "optimizer/_resources/configs/example_patch_opt.json"
+"docs/agent-reference.md" = "optimizer/_resources/docs/agent-reference.md"
+"docs/via-planning.md" = "optimizer/_resources/docs/via-planning.md"
+"docs/via-creation.md" = "optimizer/_resources/docs/via-creation.md"
+"docs/pcb-stackup.md" = "optimizer/_resources/docs/pcb-stackup.md"
+"docs/migration-0.2.0.md" = "optimizer/_resources/docs/migration-0.2.0.md"
+".agents/skills/hh-sim" = "optimizer/_resources/.agents/skills/hh-sim"
+".agents/skills/hh-via" = "optimizer/_resources/.agents/skills/hh-via"
+".agents/skills/hh-export-pcb" = "optimizer/_resources/.agents/skills/hh-export-pcb"
+".agents/skills/hh-rebuild-pcb" = "optimizer/_resources/.agents/skills/hh-rebuild-pcb"
+".agents/skills/hh-iter" = "optimizer/_resources/.agents/skills/hh-iter"
+
+[tool.hatch.build.targets.sdist]
+ignore-vcs = true
+include = ["/optimizer/**/*.py", "/pyproject.toml", "/uv.lock", "/README.md", "/CHANGELOG.md", "/LICENSE", "/AGENT.md",
+           "configs/template_*.json", "configs/example_patch_opt.json", "hfss/patch.aedt",
+           "docs/agent-reference.md", "docs/via-planning.md", "docs/via-creation.md",
+           "docs/pcb-stackup.md", "docs/migration-0.2.0.md",
+           "/optimizer/dashboard/index.html", "/optimizer/dashboard/dashboard.js", "/optimizer/dashboard/styles.css",
+           "/docs/assets/example_patch_opt_dashboard_target_reached.png",
+           "scripts/create_vias_safely.py",
+           ".agents/skills/hh-sim/**", ".agents/skills/hh-via/**", ".agents/skills/hh-export-pcb/**",
+           ".agents/skills/hh-rebuild-pcb/**", ".agents/skills/hh-iter/**"]
+exclude = ["optimizer/legacy/**", "optimizer/configs/**", "**/__pycache__/**", "**/*.pyc",
+           "/reports/**", "/runs/**", "/temp/**", "/.worktrees/**", "/.git/**", "/.codex/**",
+           "/.packages/**", "/.agents/skills/hh-git/**", "/docs/superpowers/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

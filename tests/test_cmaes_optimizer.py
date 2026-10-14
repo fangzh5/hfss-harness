@@ -63,6 +63,17 @@ def test_constructor_uses_center_local_sigma_and_quiet_bounded_options(fake_cma)
     assert optimizer.name == "CMA-ES"
 
 
+def test_failed_cases_complete_tell_without_becoming_best(fake_cma):
+    optimizer = CMAESOptimizer([(0, 1), (0, 1)])
+    points = optimizer.suggest_population()
+    results = [SimpleNamespace(params=point, cost=1e12, individual_idx=index, valid=False)
+               for index, point in enumerate(points)]
+    optimizer.update(results)
+    assert len(fake_cma.instances[-1].tell_calls) == 1
+    assert optimizer.best_params is None
+    assert optimizer.best_cost == float("inf")
+
+
 def test_constructor_supports_global_and_explicit_sigma(fake_cma):
     CMAESOptimizer(bounds=[(0.0, 1.0)], mode="global")
     assert fake_cma.instances[-1].sigma0 == pytest.approx(0.25)

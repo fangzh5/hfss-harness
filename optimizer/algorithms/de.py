@@ -79,7 +79,7 @@ class DEOptimizer(OptimizationAlgorithm):
         self.success_cr = []
 
         for result in fitness_results:
-            if not hasattr(result, "cost"):
+            if not getattr(result, "valid", True) or not hasattr(result, "cost") or not np.isfinite(result.cost):
                 continue
 
             cost = result.cost

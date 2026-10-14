@@ -8,12 +8,20 @@ import os
 import sys
 import time
 import tempfile
+from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
+    from .run_deadline import parse_deadline, budget_exhausted
+    from .metrics import collect_optional_metrics as _shared_collect_optional_metrics
+    from .case_executor import CaseExecutor, CaseJournal, finish_journal
+    from .provenance import build_execution_manifest, valid_manifest
+    from .results import TraceData, ResultBundle
+    from .stage_transition import restart_stage
+    from .result_records import pareto_front_for_json
     from .adapters import CSVAdapter, HFSSAdapter
     from .adapters.base import SimulatorAdapter
     from .algorithms import BOOptimizer, CMAESOptimizer, DEOptimizer, NSGA2Optimizer, PSOOptimizer, SurrogateOptimizer
@@ -35,8 +43,15 @@ try:
     )
     from .sweep import run_hfss_sweep
     from .validation import run_val_cases
-    from .task_config import normalize_task_type, validate_task_config
+    from .task_config import normalize_task_type, validate_task_config, resolve_evaluation_mode
 except ImportError:  # pragma: no cover
+    from run_deadline import parse_deadline, budget_exhausted
+    from metrics import collect_optional_metrics as _shared_collect_optional_metrics
+    from case_executor import CaseExecutor, CaseJournal, finish_journal
+    from provenance import build_execution_manifest, valid_manifest
+    from results import TraceData, ResultBundle
+    from stage_transition import restart_stage
+    from result_records import pareto_front_for_json
     from adapters import CSVAdapter, HFSSAdapter
     from adapters.base import SimulatorAdapter
     from algorithms import BOOptimizer, CMAESOptimizer, DEOptimizer, NSGA2Optimizer, PSOOptimizer, SurrogateOptimizer
@@ -58,7 +73,7 @@ except ImportError:  # pragma: no cover
     )
     from sweep import run_hfss_sweep
     from validation import run_val_cases
-    from task_config import normalize_task_type, validate_task_config
+    from task_config import normalize_task_type, validate_task_config, resolve_evaluation_mode
 
 try:
     from dashboard.state_bridge import DashboardStateWriter
@@ -71,12 +86,32 @@ DEFAULT_CACHE_CLEANUP_EVERY = 10
 CMAES_BAD_COST = 1.0e12
 
 
-def _cmaes_failed_result(params: np.ndarray, idx: int, reason: str) -> FitnessResult:
-    result = FitnessResult(cost=CMAES_BAD_COST)
+def _failed_batch_result(params: np.ndarray, idx: int, reason: str, calculator) -> FitnessResult:
+    objectives = getattr(calculator, "multi_objective_config", {}).get("objectives", [])
+    result = FitnessResult(cost=CMAES_BAD_COST, valid=False,
+                           objectives=[CMAES_BAD_COST] * len(objectives),
+                           constraint_violation=CMAES_BAD_COST)
     result.params = np.asarray(params, dtype=float).copy()
     result.individual_idx = int(idx)
+    result.particle_idx = int(idx)
     result.failure_reason = str(reason)
     return result
+
+
+def _penalize_failed_cma_results(results):
+    """A failed solve must rank worse than every valid observation in this batch."""
+    if not any(not getattr(item, "valid", True) for item in results):
+        return
+    valid_costs = [float(item.cost) for item in results if getattr(item, "valid", True)]
+    penalty = CMAES_BAD_COST
+    if valid_costs and max(valid_costs) >= penalty:
+        with np.errstate(over="ignore"):
+            penalty = float(np.nextafter(max(valid_costs), np.inf))
+        if not np.isfinite(penalty):
+            raise ValueError("No finite CMA failure penalty exceeds this batch's valid costs")
+    for item in results:
+        if not getattr(item, "valid", True):
+            item.cost = penalty
 
 
 DEFAULT_FITNESS_TREND_FILENAME = "fitness_trend.png"
@@ -94,7 +129,10 @@ def create_adapter(config: dict, opt_config: dict = None, task_name: str = None)
     adapter_config["task_type"] = task_type
 
     if task_type in ("opt", "sweep", "val"):
-        hfss_config = config.get("simulator", {}).get("hfss", {})
+        hfss_config = dict(config.get("simulator", {}).get("hfss", {}))
+        if task_type == "val":
+            adapter_config["evaluation_mode"] = resolve_evaluation_mode({
+                **config, "optimization": {**config.get("optimization", {}), **adapter_config}})
         return HFSSAdapter(hfss_config, adapter_config, task_name)
     if task_type == "csv":
         csv_config = config.get("simulator", {}).get("csv", {})
@@ -300,7 +338,8 @@ def _history_compat_signature(config: dict) -> dict:
     }
 
 
-def _load_manual_bo_history(config: dict, algorithm, param_mgr: ParameterManager) -> dict:
+def _load_manual_bo_history(config: dict, algorithm, param_mgr: ParameterManager, *,
+                            manifest=None, fitness_calc=None) -> dict:
     summary = {
         "requested_sources": 0,
         "accepted_sources": 0,
@@ -308,6 +347,8 @@ def _load_manual_bo_history(config: dict, algorithm, param_mgr: ParameterManager
         "loaded": 0,
         "skipped_out_of_bounds": 0,
         "skipped_invalid_rows": 0,
+        "raw_history": [],
+        "rejections": [],
     }
 
     algorithm_config = config.setdefault("algorithm", {})
@@ -328,60 +369,93 @@ def _load_manual_bo_history(config: dict, algorithm, param_mgr: ParameterManager
         return summary
 
     summary["requested_sources"] = len(sources)
-    current_signature = _history_compat_signature(config)
     bounds = np.asarray(param_mgr.get_bounds(), dtype=float)
     param_names = param_mgr.get_param_names()
-    deduped: dict[tuple[float, ...], float] = {}
+    deduped = {}
 
     for source in sources:
         source_dir = os.path.abspath(os.path.expanduser(str(source)))
-        config_path = os.path.join(source_dir, "config.json")
-        history_path = os.path.join(source_dir, task_history_file_name("opt"))
-
         try:
-            with open(config_path, "r", encoding="utf-8") as fp:
-                source_config = json.load(fp)
-        except Exception:
+            if not valid_manifest(manifest) or fitness_calc is None:
+                raise ValueError("Current model/solver context is unverified")
+            source_manifest = json.loads(Path(source_dir, "execution_manifest.json").read_text(encoding="utf-8"))
+            if not valid_manifest(source_manifest) or source_manifest["fingerprint"] != manifest["fingerprint"]:
+                raise ValueError("History model/solver context differs or is unverified")
+            with Path(source_dir, "cases.jsonl").open(encoding="utf-8") as stream:
+                rows = [json.loads(line) for line in stream if line.strip()]
+        except (OSError, ValueError, TypeError) as exc:
             summary["rejected_sources"] += 1
+            summary["rejections"].append({"source": source_dir, "reason": str(exc)})
             continue
-
-        if _history_compat_signature(source_config) != current_signature:
-            summary["rejected_sources"] += 1
-            continue
-
-        if not os.path.exists(history_path):
-            summary["rejected_sources"] += 1
-            continue
-
         summary["accepted_sources"] += 1
-        with open(history_path, "r", encoding="utf-8", newline="") as fp:
-            for row in csv.DictReader(fp):
-                try:
-                    cost = float(row.get("cost"))
-                    params = np.array([float(row.get(name)) for name in param_names], dtype=float)
-                except Exception:
-                    summary["skipped_invalid_rows"] += 1
-                    continue
-
-                if params.shape != (param_mgr.n_params,):
-                    summary["skipped_invalid_rows"] += 1
-                    continue
-
+        for row in rows:
+            if not isinstance(row, dict) or row.get("record_type") != "case_finished" or row.get("status") != "completed":
+                continue
+            try:
+                params = np.asarray(row["params"], dtype=float)
+                if params.shape != (param_mgr.n_params,) or not np.all(np.isfinite(params)):
+                    raise ValueError("Invalid history parameter vector")
                 if np.any(params < bounds[:, 0]) or np.any(params > bounds[:, 1]):
                     summary["skipped_out_of_bounds"] += 1
                     continue
-
-                key = tuple(np.round(params.astype(float), 12).tolist())
-                existing = deduped.get(key)
-                if existing is None or cost < existing:
-                    deduped[key] = float(cost)
+                if not param_mgr.check_constraints(params):
+                    raise ValueError("History point violates current constraints")
+                bundle = row["result_bundle"]
+                provenance = bundle["provenance"]
+                if (provenance.get("execution_fingerprint") != manifest["fingerprint"]
+                        or provenance.get("source_sha256") != manifest["context"]["source_sha256"]
+                        or provenance.get("solved_this_call") is not True):
+                    raise ValueError("History case lacks verified solve provenance")
+                expected = manifest["context"]["hfss"]
+                if (provenance.get("design") != manifest["context"]["actual_design"]
+                        or provenance.get("setup") != expected.get("setup_name", "Setup1")
+                        or provenance.get("sweep") != expected.get("sweep_name")):
+                    raise ValueError("History solve used a different design/setup/sweep")
+                expressions = provenance["parameters"]
+                for item, value in zip(manifest["context"]["parameters"], params):
+                    number, unit = HFSSAdapter._split_numeric_unit(expressions[item["name"]])
+                    if number is None or unit != item["unit"] or not np.isclose(number, value, rtol=1e-12, atol=1e-15):
+                        raise ValueError("History parameters disagree with acquired results")
+                for name, value in manifest["context"]["baseline_expressions"].items():
+                    if expressions.get(name) != value:
+                        raise ValueError("History fixed/dependent baseline changed")
+                for name, value in manifest["context"]["fixed_parameters"].items():
+                    if str(expressions.get(name)) != str(value):
+                        raise ValueError("History fixed parameter assignment differs")
+                traces = {}
+                for name, data in bundle["traces"].items():
+                    if data["frequency_unit"] != "GHz" or data["source"].get("variation_verified") is not True:
+                        raise ValueError("History trace has unverified variation or frequency units")
+                    traces[name] = TraceData(data["expression"], data["frequencies"], data["values"],
+                                             data["value_unit"], data["source"])
+                ResultBundle(traces, provenance)
+                if traces["s11"].value_unit != "dB":
+                    raise ValueError("History S11 must be in dB")
+                freqs, s11 = traces["s11"].frequencies_ghz, traces["s11"].values
+                s12 = traces["s12"].values if "s12" in traces else None
+                if s12 is not None and traces["s12"].value_unit != "dB":
+                    raise ValueError("History S12 must be in dB")
+                extra = row.get("extra_metrics", {})
+                json.dumps(extra, allow_nan=False)
+                result = fitness_calc.calculate(freqs, s11, s12, extra_metrics=copy.deepcopy(extra))
+                if not result.valid or not np.isfinite(result.cost):
+                    raise ValueError("History result cannot satisfy the current data contract")
+                # Exact physical points, never a rounded key or a legacy CSV cost.
+                key = tuple(params.tolist())
+                deduped[key] = {"params": params.copy(), "freqs": freqs.copy(), "s11": s11.copy(),
+                                "s12": s12.copy() if s12 is not None else None,
+                                "extra_metrics": copy.deepcopy(extra), "cost": float(result.cost),
+                                "source_sim_id": row.get("source_sim_id"), "source_dir": source_dir}
+            except (KeyError, TypeError, ValueError, AttributeError):
+                summary["skipped_invalid_rows"] += 1
 
     if deduped:
         params_matrix = np.array(list(deduped.keys()), dtype=float)
-        costs = np.array([deduped[key] for key in deduped], dtype=float)
+        costs = np.array([deduped[key]["cost"] for key in deduped], dtype=float)
         loaded = int(algorithm.preload_history(params_matrix, costs))
         summary["loaded"] = loaded
         algorithm_config["history_loaded"] = loaded
+        summary["raw_history"] = list(deduped.values())
 
     return summary
 
@@ -606,6 +680,8 @@ def _revalidate_export_candidate(
     param_mgr: ParameterManager,
     fitness_calc: FitnessCalculator,
     best_params: np.ndarray | None,
+    *, executor=None, case_id=None, enrich_metrics=None,
+    case_role="export_verification", case_fields=None, before_solve=None,
 ):
     """Quantize the best point for manufacturing and re-evaluate it."""
     if best_params is None:
@@ -614,28 +690,36 @@ def _revalidate_export_candidate(
     export_params = param_mgr.quantize_manufacturing(np.asarray(best_params, dtype=float))
     export_params = param_mgr.repair_constraints(export_params)
     if not param_mgr.check_constraints(export_params):
-        print("Manufacturable best parameters still violate constraints after repair; keeping raw best point")
-        return np.asarray(best_params, dtype=float).copy(), None, None
-    if np.allclose(export_params, np.asarray(best_params, dtype=float), atol=1e-12, rtol=0.0):
-        return export_params.copy(), None, None
+        raise RuntimeError("Manufacturable export parameters violate constraints")
+
+    if executor is not None:
+        outcome = executor.execute(
+            case_id, dict(zip(param_mgr.get_param_names(), export_params.tolist())),
+            parameter_vector=export_params, retain_success_state=True,
+            fields={**(case_fields or {}), "case_role": case_role, "params": export_params.tolist()},
+            before_solve=before_solve,
+            enrich_metrics=(lambda extra: enrich_metrics(extra, export_params)) if enrich_metrics else None)
+        if outcome.status != "completed":
+            raise RuntimeError(f"Manufacturable export verification failed: {outcome.failure_reason}")
+        outcome.fitness.params = export_params.copy()
+        return export_params, float(outcome.fitness.cost), outcome.fitness
 
     if not adapter.set_parameters(export_params):
-        print("Failed to restore manufacturable best parameters before save; keeping raw best point")
-        return np.asarray(best_params, dtype=float).copy(), None, None
+        raise RuntimeError("Failed to apply manufacturable export parameters")
 
     freqs, s11, s12 = adapter.simulate()
     if freqs is None or s11 is None:
-        print("Failed to re-simulate manufacturable best parameters before save; keeping raw best point")
-        return np.asarray(best_params, dtype=float).copy(), None, None
+        raise RuntimeError("Failed to solve manufacturable export parameters")
 
     try:
         extra_metrics = _collect_optional_metrics(config, adapter)
         export_result = fitness_calc.calculate(freqs, s11, s12, extra_metrics=extra_metrics)
+        if not getattr(export_result, "valid", True):
+            raise RuntimeError(export_result.failure_reason or "Invalid export result")
         export_result.params = export_params.copy()
         export_cost = float(getattr(export_result, "cost", float("inf")))
     except Exception as exc:
-        print(f"Manufacturable export-point verification failed: {exc}; keeping raw best point")
-        return np.asarray(best_params, dtype=float).copy(), None, None
+        raise RuntimeError(f"Manufacturable export verification failed: {exc}") from exc
 
     print(f"Manufacturable export point revalidated: {export_params.tolist()} | cost={export_cost:.4f}")
     return export_params, export_cost, export_result
@@ -648,9 +732,22 @@ def _describe_target(target_config: dict) -> str:
         freq_band = target_config.get("freq_band")
         threshold = target_config.get("s11_threshold")
         s12_threshold = target_config.get("s12_threshold", target_config.get("s21_threshold"))
+        lower_bands = target_config.get("s11_lower_bands") or []
+        lower_text = ""
+        if lower_bands:
+            parts = []
+            for band in lower_bands:
+                if not isinstance(band, dict):
+                    continue
+                band_range = band.get("freq_band")
+                lower_threshold = band.get("threshold")
+                comparator = ">" if band.get("strict", False) else ">="
+                parts.append(f"S11{comparator}{lower_threshold} dB @ {band_range} GHz")
+            if parts:
+                lower_text = " | " + ", ".join(parts)
         if s12_threshold is None:
-            return f"{threshold} dB @ {freq_band} GHz"
-        return f"S11<={threshold} dB, S12<={s12_threshold} dB @ {freq_band} GHz"
+            return f"S11<={threshold} dB @ {freq_band} GHz{lower_text}"
+        return f"S11<={threshold} dB, S12<={s12_threshold} dB @ {freq_band} GHz{lower_text}"
 
     parts = []
     for idx, stage in enumerate(stages, start=1):
@@ -669,12 +766,10 @@ def _describe_target(target_config: dict) -> str:
 def _get_candidate_batch(algorithm):
     """Return a candidate batch and whether the algorithm is batch-based."""
     if hasattr(algorithm, "suggest_population"):
-        try:
-            candidates = algorithm.suggest_population()
-            if candidates is not None and len(candidates) > 0:
-                return np.array(candidates), True
-        except Exception:
-            pass
+        candidates = np.asarray(algorithm.suggest_population(), dtype=float)
+        if candidates.ndim != 2 or candidates.shape[0] == 0 or not np.all(np.isfinite(candidates)):
+            raise ValueError("Algorithm must ask a nonempty finite 2D candidate batch")
+        return candidates, True
     return np.array([algorithm.suggest()]), False
 
 
@@ -796,6 +891,8 @@ def _cleanup_aedt_cache(adapter: SimulatorAdapter, attempts: int = 3, initial_wa
 def _target_requires_far_field_metrics(config: dict) -> bool:
     """Return True when the target objectives cannot be evaluated without far-field data."""
     target = config.get("target", {})
+    if target.get("gain_min") is not None:
+        return True
     far_field_cfg = target.get("far_field") or target.get("boresight")
     if isinstance(far_field_cfg, dict) and bool(far_field_cfg.get("required", False)):
         return True
@@ -808,7 +905,12 @@ def _target_requires_far_field_metrics(config: dict) -> bool:
         if not isinstance(objective, dict):
             continue
         obj_type = str(objective.get("type", objective.get("name", ""))).strip().lower()
-        if obj_type.startswith("pointing_error") or obj_type.startswith("peak_loss"):
+        if (
+            obj_type.startswith("peak_gain")
+            or obj_type.startswith("pointing_error")
+            or obj_type.startswith("peak_loss")
+            or obj_type.startswith("boresight_gain")
+        ):
             return True
     return False
 
@@ -835,61 +937,8 @@ def _print_simulation_header(
 
 
 def _collect_optional_metrics(config: dict, adapter: SimulatorAdapter) -> dict:
-    """Collect optional non-S-parameter metrics without changing algorithm logic."""
-    target = config.get("target", {})
-    far_field_cfg = target.get("far_field") or target.get("boresight")
-    required = _target_requires_far_field_metrics(config)
-    if not isinstance(far_field_cfg, dict):
-        if required:
-            raise RuntimeError("Required far-field metric config is missing.")
-        return {}
-    if not bool(far_field_cfg.get("enabled", False)):
-        if required:
-            raise RuntimeError("Required far-field metric config is disabled.")
-        return {}
-    if not hasattr(adapter, "get_far_field_peak_loss_band"):
-        if required:
-            raise RuntimeError("Required far-field metric API is not available on the simulator adapter.")
-        return {}
-
-    try:
-        freq_list = far_field_cfg.get("freqs")
-        if isinstance(freq_list, str):
-            freq_list = [freq_list]
-
-        kwargs = {
-            "freqs": freq_list,
-            "freq_start": far_field_cfg.get("freq_start"),
-            "freq_end": far_field_cfg.get("freq_end"),
-            "freq_step": far_field_cfg.get("freq_step"),
-            "boresight_theta": float(far_field_cfg.get("theta_deg", far_field_cfg.get("theta", 0.0))),
-            "boresight_phi": float(far_field_cfg.get("phi_deg", far_field_cfg.get("phi", 0.0))),
-            "sphere_name": far_field_cfg.get("sphere", "3D"),
-            "expression": far_field_cfg.get("expression", "RealizedGainTotal"),
-            "plane_phi_deg": (
-                None
-                if far_field_cfg.get("plane_phi_deg") is None
-                else float(far_field_cfg.get("plane_phi_deg"))
-            ),
-            "plane_tolerance_deg": float(far_field_cfg.get("plane_tolerance_deg", 1e-6)),
-            "plane_include_opposite": bool(far_field_cfg.get("plane_include_opposite", True)),
-        }
-
-        if kwargs["freqs"] is None and (
-            kwargs["freq_start"] is None or kwargs["freq_end"] is None or kwargs["freq_step"] is None
-        ):
-            kwargs["freq_start"] = float(target.get("freq_band", [0.0, 0.0])[0])
-            kwargs["freq_end"] = float(target.get("freq_band", [0.0, 0.0])[1])
-            kwargs["freq_step"] = 1.0
-
-        far_field_metrics = adapter.get_far_field_peak_loss_band(**kwargs)
-        return {"far_field": far_field_metrics}
-    except Exception as exc:
-        message = f"Optional far-field metric collection failed: {exc}"
-        print(message)
-        if required:
-            raise RuntimeError(message) from exc
-        return {}
+    """Compatibility entry point for the shared, trace-aware metric collector."""
+    return _shared_collect_optional_metrics(config, adapter)
 
 
 def _save_pareto_front(task_output_dir: str, algorithm, param_names: list[str], task_type: str = "opt") -> str | None:
@@ -899,7 +948,7 @@ def _save_pareto_front(task_output_dir: str, algorithm, param_names: list[str], 
     if not hasattr(algorithm, "get_pareto_front"):
         return None
 
-    pareto_front = algorithm.get_pareto_front()
+    pareto_front = pareto_front_for_json(algorithm.get_pareto_front())
     if not pareto_front:
         return None
 
@@ -917,8 +966,9 @@ def _save_pareto_front(task_output_dir: str, algorithm, param_names: list[str], 
             }
         )
 
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)
     with open(output_path, "w", encoding="utf-8") as fp:
-        json.dump(payload, fp, ensure_ascii=False, indent=2)
+        fp.write(serialized)
 
     print(f"Pareto front saved: {output_path}")
     return output_path
@@ -927,6 +977,8 @@ def _save_pareto_front(task_output_dir: str, algorithm, param_names: list[str], 
 def _sync_adapter_best_state(adapter: SimulatorAdapter, best_params: np.ndarray | None, best_cost: float | None) -> None:
     """Ensure the adapter can restore the representative best candidate before saving."""
     if best_params is None:
+        adapter.best_params = None
+        adapter.best_fitness = float("inf")
         return
 
     try:
@@ -943,7 +995,7 @@ def _sync_adapter_best_state(adapter: SimulatorAdapter, best_params: np.ndarray 
 
 def plot_s11(freqs: np.ndarray, s11: np.ndarray, output_path: str = None, threshold: float = -10):
     """Plot S11 versus frequency."""
-    f_ghz = freqs / 1e9 if np.mean(freqs) > 1000 else freqs
+    f_ghz = np.asarray(freqs, dtype=float)
 
     plt.figure(figsize=(10, 6))
     plt.plot(f_ghz, s11, "b-", linewidth=2)
@@ -1367,6 +1419,9 @@ class SimulationDataLogger:
             bo_diagnostics = extra_metrics.get("bo_diagnostics") if isinstance(extra_metrics, dict) else None
             if isinstance(bo_diagnostics, dict):
                 record["bo_diagnostics"] = bo_diagnostics
+            for key in ("result_bundle", "traces"):
+                if isinstance(extra_metrics, dict) and key in extra_metrics:
+                    record[key] = extra_metrics[key]
             self.full_fp.write(json.dumps(record, ensure_ascii=False) + "\n")
 
         self.full_fp.flush()
@@ -1378,6 +1433,54 @@ class SimulationDataLogger:
 
 def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterManager,
                      fitness_calc: FitnessCalculator, algorithm):
+    """Keep compatibility returns while recording failures and closing every log."""
+    opt = config.get("optimization", {})
+    output_dir = Path(opt.get("task_output_dir") or resolve_task_output_dir(config, run_stamp=opt.get("run_stamp")))
+    journal = CaseJournal(output_dir / "cases.jsonl")
+    resources = []
+    adapter.last_task_outcome = {"status": "Running"}
+    adapter._task_dashboard_writer = None
+    adapter._task_completion_message = None
+    adapter._case_executor = None
+    adapter._optimization_finished = False
+    adapter._optimization_export_saved = False
+    try:
+        result = _run_optimization_impl(config, adapter, param_mgr, fitness_calc, algorithm, journal, resources)
+        # Search cases already restore themselves. Final export deliberately
+        # retains its verified point; nothing should mutate the work model now.
+        (output_dir / "optimization_summary.json").write_text(
+            json.dumps(adapter.last_task_outcome, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+        finish_journal(journal, status=adapter.last_task_outcome["status"],
+                       reason=adapter._task_completion_message or adapter.last_task_outcome.get("termination_reason"),
+                       writer=adapter._task_dashboard_writer)
+        return result
+    except BaseException as exc:
+        status = "Stopped" if isinstance(exc, KeyboardInterrupt) else "Failed"
+        restore_error = None
+        if adapter._case_executor is not None and not adapter._optimization_export_saved:
+            try:
+                adapter._case_executor.restore()
+            except Exception as error:
+                restore_error = str(error)
+                status = "Failed"
+        adapter.last_task_outcome = {**adapter.last_task_outcome, "status": status,
+                                    "failure_reason": str(exc) or type(exc).__name__}
+        if restore_error is not None:
+            adapter.last_task_outcome["restore_failure"] = restore_error
+        finish_journal(journal, status=status, reason=adapter.last_task_outcome["failure_reason"],
+                       writer=adapter._task_dashboard_writer)
+        (output_dir / "optimization_summary.json").write_text(
+            json.dumps(adapter.last_task_outcome, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+        raise
+    finally:
+        adapter._optimization_finished = True
+        for resource in resources:
+            resource.close()
+        journal.close()
+
+
+def _run_optimization_impl(config: dict, adapter: HFSSAdapter, param_mgr: ParameterManager,
+                           fitness_calc: FitnessCalculator, algorithm, journal, resources):
     """Run the optimization loop."""
     task_type = normalize_task_type(config)
     target_config = config.get("target", {})
@@ -1385,6 +1488,7 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
     output_config = config.get("output", {})
     opt_config = config.get("optimization", {})
     algo_method = str(algo_config.get("method", "de")).lower()
+    stop_on_target = opt_config.get("stop_on_target", not fitness_calc.is_multi_objective)
     continuous_search = _use_continuous_search(algo_method, opt_config)
     task_name = config.get("name", "task")
     hfss_config = config.get("simulator", {}).get("hfss", {})
@@ -1398,7 +1502,16 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
         patience = 15
     early_stop_enabled = patience > 0
     max_simulations = algo_config.get("max_simulations")
+    max_attempts = opt_config.get("max_attempts", max(50, int(max_iters) * int(algo_config.get("population_size", 30)) * 5))
+    max_failures = opt_config.get("max_consecutive_failures", 5)
+    for name, value in (("max_attempts", max_attempts), ("max_consecutive_failures", max_failures)):
+        if type(value) is not int or value < 1:
+            raise ValueError(f"optimization.{name} must be a positive integer")
+    end_at = parse_deadline(opt_config.get("end_at"))
+    longest_simulation = 0.0
     save_interval = opt_config.get("save_interval", 10)
+    if type(save_interval) is not int or save_interval < 0:
+        raise ValueError("optimization.save_interval must be a nonnegative integer")
     cleanup_every = opt_config.get("cleanup_every", DEFAULT_CACHE_CLEANUP_EVERY)
     try:
         cleanup_every = int(cleanup_every)
@@ -1432,6 +1545,72 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
     task_output_dir = opt_config.get("task_output_dir") or resolve_task_output_dir(config, run_stamp=run_stamp)
     task_output_dir = str(task_output_dir)
     os.makedirs(task_output_dir, exist_ok=True)
+    if not callable(getattr(adapter, "capture_current_parameter_state", None)) or not callable(
+            getattr(adapter, "restore_parameter_state", None)):
+        raise ValueError("Optimization requires an adapter with complete parameter capture/restore")
+    adapter.config.setdefault("param_names", param_mgr.get_param_names())
+    adapter.config.setdefault("param_units", [item.get("unit", "mm") for item in config["parameters"]])
+    if list(adapter.config["param_names"]) != param_mgr.get_param_names():
+        raise ValueError("Optimization parameter names differ from the adapter contract")
+    baseline = adapter.capture_current_parameter_state()
+    if not isinstance(baseline, dict) or not baseline or set(param_mgr.get_param_names()) - baseline.keys():
+        raise ValueError("Optimization requires a complete baseline with all configured parameters")
+    executor = CaseExecutor(adapter, fitness_calc, config, baseline, journal,
+                            metrics_collector=_collect_optional_metrics)
+    adapter._case_executor = executor
+    def enrich_for_parameters(extra, params):
+        geometry_extra = _build_geometry_metric_extra(
+            params=params, param_names=param_mgr.get_param_names(),
+            baseline_state=geometry_baseline_state, geometry_cfg=geometry_metric_config,
+            adapter=adapter)
+        if geometry_extra:
+            extra.update(geometry_extra)
+    periodic_exports = []
+    export_solve_attempts = 0
+    last_periodic_export_sim = 0
+
+    def begin_export_solve():
+        nonlocal export_solve_attempts
+        export_solve_attempts += 1
+        adapter.last_task_outcome["export_verification_solve_attempts"] = export_solve_attempts
+
+    def export_periodic_best():
+        nonlocal last_periodic_export_sim
+        if not save_interval or best_params is None or sim_count // save_interval <= last_periodic_export_sim // save_interval:
+            return
+        last_periodic_export_sim = sim_count
+        if budget_exhausted(end_at, time.time(), longest_simulation, opt_config.get("save_best_on_exit", True)):
+            journal.append({"record_type": "best_model_export_skipped", "search_simulations": sim_count,
+                            "reason": "time_budget"})
+            return
+        path = Path(task_output_dir) / f"best_after_{sim_count}_sim.aedt"
+        try:
+            # Negative IDs are reserved for periodic verification, outside the
+            # positive search-attempt IDs and the final verification ID.
+            params, cost, _ = _revalidate_export_candidate(
+                config, adapter, param_mgr, fitness_calc, best_params, executor=executor,
+                case_id=-(len(periodic_exports) + 1), enrich_metrics=enrich_for_parameters,
+                case_role="periodic_export_verification",
+                case_fields={"search_simulations": sim_count, "best_source_sim_id": best_sim_id},
+                before_solve=begin_export_solve)
+            _sync_adapter_best_state(adapter, params, cost)
+            if not adapter.save_best_result(output_path=str(path)):
+                raise RuntimeError("Periodic best project could not be saved")
+            event = {"record_type": "best_model_exported", "export_kind": "periodic",
+                     "search_simulations": sim_count, "best_source_sim_id": best_sim_id,
+                     "params": params.tolist(), "cost": cost, "path": str(path)}
+            periodic_exports.append(event)
+            adapter.last_task_outcome["periodic_exports"] = periodic_exports.copy()
+            journal.append(event)
+        finally:
+            # Optimization continues after a periodic snapshot, so normal case
+            # isolation still applies. Final export has no such restoration.
+            executor.restore()
+            _sync_adapter_best_state(adapter, best_params, best_cost)
+    manifest = build_execution_manifest(config, adapter)
+    adapter.execution_fingerprint = manifest["fingerprint"]
+    with Path(task_output_dir, "execution_manifest.json").open("x", encoding="utf-8") as stream:
+        json.dump(manifest, stream, ensure_ascii=False, indent=2, allow_nan=False)
     history_load_summary = {
         "requested_sources": 0,
         "accepted_sources": 0,
@@ -1441,9 +1620,14 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
         "skipped_invalid_rows": 0,
     }
     if str(config.get("algorithm", {}).get("method", "")).strip().lower() == "bo":
-        history_load_summary = _load_manual_bo_history(config, algorithm, param_mgr)
+        history_load_summary = _load_manual_bo_history(
+            config, algorithm, param_mgr, manifest=manifest, fitness_calc=fitness_calc)
+    with Path(task_output_dir, "history_import_summary.json").open("x", encoding="utf-8") as stream:
+        json.dump({key: value for key, value in history_load_summary.items() if key != "raw_history"},
+                  stream, ensure_ascii=False, indent=2, allow_nan=False)
 
     logger = OptimizationLogger(os.path.join(task_output_dir, task_history_file_name(task_type)), param_mgr.get_param_names())
+    resources.append(logger)
     raw_enabled = output_config.get("save_data", output_config.get("save_csv", True))
     data_logger = SimulationDataLogger(
         task_output_dir,
@@ -1452,6 +1636,7 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
         enabled=raw_enabled,
         storage_format=output_config.get("raw_data_format", "jsonl"),
     )
+    resources.append(data_logger)
     fitness_trend_enabled = output_config.get("plot_fitness_trend", True)
     fitness_trend_path = os.path.join(task_output_dir, task_fitness_trend_file_name(task_type))
     pareto_front_plot_path = os.path.join(task_output_dir, task_pareto_front_file_name(task_type, "png"))
@@ -1466,6 +1651,8 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
     except Exception as exc:
         print(f"Dashboard snapshot writer disabled: {exc}")
 
+    adapter._task_dashboard_writer = dashboard_writer
+
     best_cost = float("inf")
     best_params = None
     best_result = None
@@ -1473,7 +1660,13 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
     iteration = 0
     patience_counter = 0
     sim_count = 0
-    simulation_cache: dict[tuple[str, ...], FitnessResult] = {}
+    solve_attempts = 0
+    simulation_cache: dict[tuple[str, ...], dict] = {}
+    for data in history_load_summary.get("raw_history", []):
+        simulation_cache[_simulation_cache_key(data["params"], param_mgr, adapter)] = data
+    attempt_count = 0
+    failure_count = 0
+    consecutive_failures = 0
     termination_reason = "max_iters"
     raw_fitness_history: list[float] = []
     stop_requested = False
@@ -1521,6 +1714,8 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
 
         try:
             candidates, batch_mode = _get_candidate_batch(algorithm)
+            if not len(candidates) or candidates.shape != (len(candidates), param_mgr.n_params):
+                raise ValueError("Algorithm candidate dimension differs from the parameter contract")
         except DuplicateCandidateExhausted as exc:
             print(f"\n{exc}")
             termination_reason = "duplicate_retries"
@@ -1549,6 +1744,18 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
         retry_current_iteration = False
 
         for idx, candidate in enumerate(candidates):
+            if max_simulations is not None and solve_attempts >= max_simulations:
+                sim_limit_reached = True
+                break
+            if attempt_count >= max_attempts:
+                termination_reason = "attempt_budget"
+                break
+            if consecutive_failures >= max_failures:
+                termination_reason = "failure_budget"
+                break
+            if budget_exhausted(end_at, time.time(), longest_simulation, opt_config.get("save_best_on_exit", True)):
+                termination_reason = "time_budget"
+                break
             params = _project_search_params(
                 np.array(candidate, dtype=float),
                 param_mgr,
@@ -1556,10 +1763,17 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
             )
             sim_params = param_mgr.quantize_manufacturing(params) if continuous_search else params.copy()
             sim_params = param_mgr.repair_constraints(sim_params)
+            attempt_count += 1
+            journal.append({"record_type": "case_started", "case_id": attempt_count,
+                            "iteration": effective_iteration, "params": sim_params.tolist()})
 
             if not param_mgr.check_constraints(sim_params):
-                if algo_method == "cmaes":
-                    round_results.append(_cmaes_failed_result(sim_params, idx, "constraints"))
+                failure_count += 1
+                consecutive_failures += 1
+                journal.append({"record_type": "case_finished", "case_id": attempt_count,
+                                "status": "failed", "failure_reason": "constraints"})
+                if batch_mode:
+                    round_results.append(_failed_batch_result(sim_params, idx, "constraints", fitness_calc))
                 continue
 
             _sync_candidate_state(algorithm, idx, sim_params)
@@ -1573,59 +1787,80 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
                     except Exception as exc:
                         print(f"BO cache-reject registration failed: {exc}")
                     retry_current_iteration = True
+                    journal.append({"record_type": "case_finished", "case_id": attempt_count,
+                                    "status": "cache_rejected", "source_sim_id": cached_fitness["source_sim_id"]})
                     print(f"[Cache] iter={effective_iteration}, rejected cached BO candidate for {list(cache_key)}")
                     break
-                reused = copy.deepcopy(cached_fitness)
+                reused = fitness_calc.calculate(cached_fitness["freqs"], cached_fitness["s11"],
+                    cached_fitness["s12"], extra_metrics=copy.deepcopy(cached_fitness["extra_metrics"]))
+                if not getattr(reused, "valid", True) or not np.isfinite(reused.cost):
+                    failure_count += 1
+                    consecutive_failures += 1
+                    journal.append({"record_type": "case_finished", "case_id": attempt_count,
+                                    "status": "failed", "failure_reason": reused.failure_reason})
+                    if batch_mode:
+                        round_results.append(_failed_batch_result(sim_params, idx, "invalid_cache", fitness_calc))
+                    continue
+                reused.params = sim_params.copy()
+                consecutive_failures = 0
+                reused.source_sim_id = cached_fitness["source_sim_id"]
+                journal.append({"record_type": "case_finished", "case_id": attempt_count,
+                                "status": "cache_reused", "source_sim_id": reused.source_sim_id,
+                                "cost": float(reused.cost), "stage_index": getattr(reused, "stage_index", None)})
                 if batch_mode:
                     reused.individual_idx = idx
                     reused.particle_idx = idx
                 round_results.append(reused)
+                if not is_multi_objective and adapter.update_best(sim_params, reused.cost):
+                    best_params, best_cost, best_result = sim_params.copy(), reused.cost, reused
+                    best_sim_id = reused.source_sim_id
+                    round_improved = True
+                    patience_counter = 0
                 round_stage_met = round_stage_met or getattr(reused, "stage_met", False)
                 print(f"[Cache] iter={effective_iteration}, reuse sim={getattr(reused, 'source_sim_id', 'n/a')} for {list(cache_key)}")
-                if reused.target_met:
+                if reused.target_met and stop_on_target:
                     round_target_met = True
                     break
                 continue
 
-            if not adapter.set_parameters(sim_params):
-                if algo_method == "cmaes":
-                    round_results.append(_cmaes_failed_result(sim_params, idx, "set_parameters"))
-                continue
-
             next_sim_id = sim_count + 1
-            _print_simulation_header(next_sim_id, effective_iteration, setup_name, sim_params, param_mgr.get_param_names(), cleanup_every)
-            if dashboard_writer is not None:
-                try:
-                    dashboard_writer.begin_simulation(sim_id=next_sim_id, iter_id=effective_iteration)
-                except Exception as exc:
-                    print(f"Dashboard simulation timer start failed: {exc}")
+            def begin_solve():
+                _print_simulation_header(next_sim_id, effective_iteration, setup_name, sim_params,
+                                         param_mgr.get_param_names(), cleanup_every)
+                if dashboard_writer is not None:
+                    try:
+                        dashboard_writer.begin_simulation(sim_id=next_sim_id, iter_id=effective_iteration)
+                    except Exception as exc:
+                        print(f"Dashboard simulation timer start failed: {exc}")
 
-            freqs, s11, s12 = adapter.simulate()
-            if freqs is None or s11 is None:
-                if algo_method == "cmaes":
-                    round_results.append(_cmaes_failed_result(sim_params, idx, "simulate"))
+            def enrich_metrics(extra):
+                enrich_for_parameters(extra, sim_params)
+
+            outcome = executor.execute(
+                attempt_count, dict(zip(param_mgr.get_param_names(), sim_params.tolist())),
+                fields={"iteration": effective_iteration, "params": sim_params.tolist(),
+                        "source_sim_id": next_sim_id, "case_role": "optimization"},
+                parameter_vector=sim_params, before_solve=begin_solve,
+                enrich_metrics=enrich_metrics, already_started=True)
+            solve_attempts += int(outcome.simulation_attempted)
+            if outcome.simulation_attempted:
+                longest_simulation = max(longest_simulation, outcome.duration_seconds)
+            if outcome.result_acquired:
+                sim_count += 1
+                round_has_new_simulation = True
+            if outcome.status != "completed":
+                failure_count += 1
+                consecutive_failures += 1
+                if outcome.failure_phase == "metrics":
+                    termination_reason = "metric_collection_failed"
+                    metric_collection_failed = True
+                    break
+                if batch_mode:
+                    round_results.append(_failed_batch_result(sim_params, idx, outcome.failure_reason, fitness_calc))
                 continue
-
-            sim_count += 1
-            round_has_new_simulation = True
-
-            try:
-                extra_metrics = _collect_optional_metrics(config, adapter)
-            except Exception as exc:
-                print(f"Required metric collection failed; stopping optimization: {exc}")
-                termination_reason = "metric_collection_failed"
-                metric_collection_failed = True
-                break
-            geometry_extra = _build_geometry_metric_extra(
-                params=sim_params,
-                param_names=param_mgr.get_param_names(),
-                baseline_state=geometry_baseline_state,
-                geometry_cfg=geometry_metric_config,
-                adapter=adapter,
-            )
-            if geometry_extra:
-                extra_metrics.update(geometry_extra)
-            fitness = fitness_calc.calculate(freqs, s11, s12, extra_metrics=extra_metrics)
+            freqs, s11, s12 = outcome.freqs, outcome.s11, outcome.s12
+            extra_metrics, fitness = outcome.extra_metrics, outcome.fitness
+            consecutive_failures = 0
             bo_diagnostics = None
             if algo_method == "bo" and hasattr(algorithm, "attach_result_diagnostics"):
                 try:
@@ -1640,7 +1875,12 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
                 fitness.individual_idx = idx
                 fitness.particle_idx = idx
 
-            simulation_cache[cache_key] = copy.deepcopy(fitness)
+            simulation_cache[cache_key] = {
+                "params": sim_params.copy(),
+                "freqs": np.asarray(freqs).copy(), "s11": np.asarray(s11).copy(),
+                "s12": np.asarray(s12).copy() if s12 is not None else None,
+                "extra_metrics": copy.deepcopy(extra_metrics), "source_sim_id": sim_count,
+            }
             round_results.append(fitness)
 
             is_checkpoint = bool(save_interval and sim_count % save_interval == 0)
@@ -1702,11 +1942,14 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
                     f"s11={fitness.s11_max:.2f} dB{s12_text}"
                 )
 
-            if fitness.target_met:
+            if not is_multi_objective:
+                export_periodic_best()
+
+            if fitness.target_met and stop_on_target:
                 round_target_met = True
                 break
 
-            if max_simulations is not None and sim_count >= max_simulations:
+            if max_simulations is not None and solve_attempts >= max_simulations:
                 sim_limit_reached = True
                 break
 
@@ -1718,21 +1961,15 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
                 except Exception as exc:
                     print(f"Dashboard stop-state check failed: {exc}")
 
-        cmaes_batch_complete = (
-            algo_method == "cmaes"
-            and batch_mode
-            and len(round_results) == len(candidates)
-        )
-        algorithm_update_ready = (
-            cmaes_batch_complete
-            if algo_method == "cmaes"
-            else round_has_new_simulation
-        )
+        batch_complete = batch_mode and len(round_results) == len(candidates)
+        algorithm_update_ready = batch_complete if batch_mode else (round_has_new_simulation and bool(round_results))
         if round_results and algorithm_update_ready:
             try:
+                if algo_method == "cmaes":
+                    _penalize_failed_cma_results(round_results)
                 algorithm.update(round_results)
             except Exception as e:
-                print(f"Algorithm update failed: {e}")
+                raise RuntimeError(f"Algorithm update failed: {e}") from e
             else:
                 if is_multi_objective and getattr(algorithm, "best_params", None) is not None:
                     best_params = np.asarray(algorithm.best_params, dtype=float).copy()
@@ -1768,6 +2005,35 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
                             print(f"Pareto front plot update failed: {exc}")
                             fitness_trend_enabled = False
 
+                if is_multi_objective:
+                    # The representative best is selected by the completed
+                    # population update; defer crossed intervals to that point.
+                    export_periodic_best()
+
+        if batch_mode and is_multi_objective and not batch_complete and round_results:
+            finalize_partial = getattr(algorithm, "finalize_partial_batch", None)
+            if callable(finalize_partial):
+                finalize_partial(round_results)
+                if getattr(algorithm, "best_result", None) is not None:
+                    best_result = algorithm.best_result
+                    best_params = np.asarray(algorithm.best_params, dtype=float).copy()
+                    best_cost = float(algorithm.best_cost)
+                    best_sim_id = algorithm.best_source_sim_id
+                    journal.append({"record_type": "partial_batch_best_selected",
+                                    "iteration": effective_iteration, "source_sim_id": best_sim_id,
+                                    "params": best_params.tolist(), "cost": best_cost,
+                                    "target_met": bool(getattr(best_result, "target_met", False))})
+
+        if batch_mode:
+            journal.append({"record_type": "batch_finished", "iteration": effective_iteration,
+                            "planned_candidates": len(candidates), "evaluated_candidates": len(round_results),
+                            "valid_candidates": sum(bool(getattr(item, "valid", True)) for item in round_results),
+                            "complete": batch_complete, "algorithm_updated": bool(algorithm_update_ready)})
+
+        if termination_reason in {"time_budget", "attempt_budget", "failure_budget"}:
+            print(f"\nOptimization budget reached: {termination_reason}")
+            break
+
         if stop_requested:
             print("\nStop requested from dashboard; ending after current simulation.")
             termination_reason = "user_stop"
@@ -1779,16 +2045,41 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
         if retry_current_iteration:
             continue
 
-        if round_has_new_simulation or cmaes_batch_complete:
+        if sim_limit_reached:
+            termination_reason = "max_simulations"
+            break
+
+        if round_target_met:
+            print("\nTarget reached!")
+            termination_reason = "target_met"
+            break
+
+        if algorithm_update_ready:
             iteration += 1
         else:
             if round_target_met:
                 iteration += 1
             continue
 
+        stage_advanced = False
         if round_stage_met and not round_target_met:
             if fitness_calc.advance_stage():
+                stage_advanced = True
                 next_stage = fitness_calc.active_stage
+                algorithm, best_result, rescored_count = restart_stage(
+                    config, param_mgr, fitness_calc, algorithm, simulation_cache, adapter,
+                    factory=create_algorithm, cache_key=_simulation_cache_key)
+                executor.calculator = fitness_calc
+                adapter.active_algorithm = algorithm
+                best_params = best_result.params.copy() if best_result is not None else None
+                best_cost = float(best_result.cost) if best_result is not None else float("inf")
+                best_sim_id = best_result.source_sim_id if best_result is not None else None
+                _sync_adapter_best_state(adapter, best_params, best_cost)
+                journal.append({"record_type": "stage_transition", "stage_index": fitness_calc.stage_index,
+                                "stage_name": next_stage.name, "strategy": "rescore_and_restart",
+                                "rescored_observations": rescored_count,
+                                "best_params": best_params.tolist() if best_params is not None else None,
+                                "best_cost": best_cost if best_params is not None else None})
                 print(
                     f"\nStage advanced -> {next_stage.name}: "
                     f"S11<={next_stage.s11_target} dB"
@@ -1807,6 +2098,25 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
                 round_improved = True
                 patience_counter = 0
 
+        advance_penalty = getattr(fitness_calc, "advance_penalty_epoch", None)
+        if (not stage_advanced and not round_target_met and algorithm_update_ready
+                and round_has_new_simulation and callable(advance_penalty)
+                and advance_penalty(round_results)):
+            algorithm, best_result, rescored_count = restart_stage(
+                config, param_mgr, fitness_calc, algorithm, simulation_cache, adapter,
+                factory=create_algorithm, cache_key=_simulation_cache_key)
+            adapter.active_algorithm = algorithm
+            best_params = best_result.params.copy() if best_result is not None else None
+            best_cost = float(best_result.cost) if best_result is not None else float("inf")
+            best_sim_id = best_result.source_sim_id if best_result is not None else None
+            _sync_adapter_best_state(adapter, best_params, best_cost)
+            journal.append({"record_type": "penalty_epoch_transition", "iteration": iteration,
+                            "stage_index": fitness_calc.stage_index,
+                            "adaptive_scales": fitness_calc.adaptive_scales.copy(),
+                            "strategy": "rescore_and_restart", "rescored_observations": rescored_count,
+                            "best_cost": best_cost if best_params is not None else None})
+            # A changed scale is not evidence that a better physical case was found.
+
         if not round_improved and round_results:
             patience_counter += 1
 
@@ -1820,40 +2130,6 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
             termination_reason = "early_stop"
             break
 
-        if round_target_met:
-            print("\nTarget reached!")
-            termination_reason = "target_met"
-            break
-
-    logger.close()
-    data_logger.close()
-    if dashboard_writer is not None:
-        if termination_reason == "target_met":
-            final_status = "Completed"
-            final_detail = "Target reached"
-        elif termination_reason == "max_simulations":
-            final_status = "Stopped"
-            final_detail = "Max simulations reached"
-        elif termination_reason == "user_stop":
-            final_status = "Stopped"
-            final_detail = "Stop requested from dashboard"
-        elif termination_reason == "early_stop":
-            final_status = "Stopped"
-            final_detail = f"Early stop after {patience} rounds"
-        elif termination_reason == "metric_collection_failed":
-            final_status = "Failed"
-            final_detail = "Required metric collection failed"
-        elif termination_reason == "duplicate_retries":
-            final_status = "Stopped"
-            final_detail = "Duplicate candidate retries exhausted"
-        else:
-            final_status = "Stopped"
-            final_detail = "Optimization finished"
-        try:
-            dashboard_writer.finalize(final_status, final_detail)
-        except Exception as exc:
-            print(f"Dashboard snapshot finalize failed: {exc}")
-
     print(f"\nOptimization done | total sims: {sim_count} | best cost: {best_cost:.4f}")
     if best_params is not None:
         for name, val in zip(param_mgr.get_param_names(), best_params):
@@ -1866,13 +2142,18 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
             param_mgr=param_mgr,
             fitness_calc=fitness_calc,
             best_params=best_params,
+            executor=executor, case_id=attempt_count + 1, enrich_metrics=enrich_for_parameters,
+            before_solve=begin_export_solve,
         )
         if export_result is not None:
             best_result = export_result
         final_best_params = export_params if export_params is not None else best_params
         final_best_cost = export_cost if export_cost is not None else best_cost
         _sync_adapter_best_state(adapter, final_best_params, final_best_cost)
-        adapter.save_best_result(output_dir=task_output_dir, sim_id=best_sim_id)
+        if not adapter.save_best_result(output_dir=task_output_dir, sim_id=best_sim_id):
+            raise RuntimeError("Verified best project could not be saved")
+        adapter._optimization_export_saved = True
+        best_params, best_cost = final_best_params, final_best_cost
     if is_multi_objective:
         _save_pareto_front(task_output_dir, algorithm, param_mgr.get_param_names(), task_type=task_type)
         if fitness_trend_enabled:
@@ -1885,6 +2166,31 @@ def run_optimization(config: dict, adapter: HFSSAdapter, param_mgr: ParameterMan
             except Exception as exc:
                 print(f"Pareto front plot finalize failed: {exc}")
 
+    failed = termination_reason in {"metric_collection_failed", "failure_budget"} or (
+        not simulation_cache and termination_reason not in {"user_stop", "time_budget"})
+    final_status = "Failed" if failed else ("Completed" if termination_reason in {"max_iters", "target_met"} else "Stopped")
+    adapter.last_task_outcome = {
+        "status": final_status, "termination_reason": termination_reason,
+        "attempts": attempt_count, "failures": failure_count, "simulations": sim_count,
+        "solve_attempts": solve_attempts,
+        "valid_simulations": len(simulation_cache),
+        "best_params": best_params.tolist() if best_params is not None else None,
+        "best_cost": float(best_cost) if best_params is not None else None,
+        "target_met": bool(getattr(best_result, "target_met", False)),
+        "export_verified": bool(opt_config.get("save_best_on_exit", True) and best_params is not None),
+        "periodic_exports": periodic_exports,
+        "export_verification_solve_attempts": export_solve_attempts,
+        "total_solve_attempts": solve_attempts + export_solve_attempts,
+    }
+    if dashboard_writer is not None:
+        details = {"target_met": "Target reached", "max_iters": "Optimization finished",
+                   "max_simulations": "Max simulations reached", "time_budget": "Time budget reached",
+                   "early_stop": "Early stop after no improvement", "user_stop": "Stop requested from dashboard",
+                   "duplicate_retries": "Duplicate candidate retries exhausted",
+                   "failure_budget": "Consecutive failure limit reached",
+                   "attempt_budget": "Candidate attempt limit reached",
+                   "metric_collection_failed": "Required metric collection failed"}
+        adapter._task_completion_message = details.get(termination_reason, "Optimization finished")
     return best_params, best_cost, best_result
 
 
@@ -1922,6 +2228,7 @@ def run_single_simulation(config: dict, adapter: HFSSAdapter):
         fitness_config=target_config.get("fitness"),
         multi_objective_config=target_config.get("multi_objective"),
         s11_profile=target_config.get("s11_profile"),
+        s11_lower_bands=target_config.get("s11_lower_bands"),
     )
 
     raw_enabled = output_config.get("save_data", output_config.get("save_csv", True))
@@ -2017,9 +2324,13 @@ def run_task(
 
     try:
         if task_type == "sweep":
-            run_hfss_sweep(config, adapter)
+            result = run_hfss_sweep(config, adapter)
+            if isinstance(result, dict) and result.get("status") == "Failed":
+                return 1
         elif task_type == "val":
-            run_val_cases(config, adapter)
+            result = run_val_cases(config, adapter)
+            if isinstance(result, dict) and result.get("status") == "Failed":
+                return 1
         elif task_type == "opt":
             param_mgr = ParameterManager(config["parameters"])
 
@@ -2035,6 +2346,7 @@ def run_task(
                 fitness_config=target.get("fitness"),
                 multi_objective_config=target.get("multi_objective"),
                 s11_profile=target.get("s11_profile"),
+                s11_lower_bands=target.get("s11_lower_bands"),
             )
 
             param_names = [p["name"] for p in config["parameters"]]
@@ -2050,6 +2362,8 @@ def run_task(
             if getattr(algorithm, "is_multi_objective", False) and not fitness_calc.is_multi_objective:
                 raise ValueError("Multi-objective algorithms require target.multi_objective.enabled=true.")
             run_optimization(config, adapter, param_mgr, fitness_calc, algorithm)
+            if getattr(adapter, "last_task_outcome", {}).get("status") == "Failed":
+                return 1
         else:
             run_single_simulation(config, adapter)
     finally:
@@ -2058,7 +2372,7 @@ def run_task(
 
 
 def _apply_default_single_objective_fitness_config(config: dict) -> None:
-    """Default single-objective runs to algorithm-aware fitness wrappers."""
+    """Choose a target-owned scalarization independently of the search algorithm."""
     target = config.get("target")
     if not isinstance(target, dict):
         return
@@ -2074,9 +2388,6 @@ def _apply_default_single_objective_fitness_config(config: dict) -> None:
     if target["objective_mode"] == "legacy":
         return
 
-    algorithm_cfg = config.get("algorithm") or {}
-    method = str(algorithm_cfg.get("method", "") or "").strip().lower()
-    default_strategy = "bo" if method == "bo" else "de"
 
     fitness_cfg = target.get("fitness")
     if fitness_cfg is None:
@@ -2085,5 +2396,6 @@ def _apply_default_single_objective_fitness_config(config: dict) -> None:
     elif not isinstance(fitness_cfg, dict):
         return
 
-    fitness_cfg.setdefault("single_objective_strategy", default_strategy)
+    if "single_objective_strategy" not in fitness_cfg:
+        fitness_cfg.setdefault("scalarization", "weighted_metrics")
     fitness_cfg.setdefault("adaptive_penalty", False)

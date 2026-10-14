@@ -33,7 +33,8 @@ class CSVAdapter(SimulatorAdapter):
 
         try:
             reader = ResultReader()
-            self.freqs, self.s11, self.s21 = reader.read_csv(self.data_path)
+            self.freqs, self.s11, self.s21 = reader.read_csv(
+                self.data_path, frequency_unit=self.config.get("frequency_unit", "GHz"), columns=self.columns)
             self._is_connected = True
             print(f"已加载CSV数据: {self.data_path}")
             return True

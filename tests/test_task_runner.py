@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
 
 from optimizer import task_runner
 from optimizer.algorithms.bo import DuplicateCandidateExhausted
+from fake_parameter_state import FakeParameterState
 
 
 class DummyAdapter:
@@ -83,7 +84,7 @@ def test_create_algorithm_leaves_missing_cmaes_initial_point_for_center_default(
     assert captured["seed"] is None
 
 
-def test_cmaes_defaults_to_de_scalar_fitness():
+def test_cmaes_defaults_to_algorithm_independent_scalar_fitness():
     config = {
         "target": {"freq_band": [54.0, 66.0], "s11_threshold": -10},
         "algorithm": {"method": "cmaes"},
@@ -91,7 +92,7 @@ def test_cmaes_defaults_to_de_scalar_fitness():
 
     task_runner._apply_default_single_objective_fitness_config(config)
 
-    assert config["target"]["fitness"]["single_objective_strategy"] == "de"
+    assert config["target"]["fitness"]["scalarization"] == "weighted_metrics"
 
 
 def test_run_task_dispatches_sweep(monkeypatch, tmp_path):
@@ -168,7 +169,7 @@ def test_simulation_data_logger_writes_jsonl_record(tmp_path):
     assert payload["bo_diagnostics"]["summary"]["mae"] == 0.35
 
 
-class DummyOptAdapter(DummyAdapter):
+class DummyOptAdapter(FakeParameterState, DummyAdapter):
     def __init__(self):
         super().__init__()
         self.current_params = None
@@ -460,7 +461,7 @@ def test_run_optimization_completes_cmaes_batch_with_bad_cost_for_failed_candida
     assert algorithm.results[0].cost == pytest.approx(0.04)
     assert np.isfinite(algorithm.results[1].cost)
     assert algorithm.results[1].cost > algorithm.results[0].cost
-    assert algorithm.results[1].failure_reason == "set_parameters"
+    assert algorithm.results[1].failure_reason == "Parameter transaction failed"
     history_lines = (tmp_path / "run" / "opt_history.csv").read_text(encoding="utf-8").splitlines()
     assert len(history_lines) == 2
 
@@ -503,7 +504,7 @@ def test_run_optimization_advances_one_cmaes_generation_when_all_candidates_fail
 
     assert algorithm.update_calls == 1
     assert len(algorithm.results) == 2
-    assert all(result.failure_reason == "simulate" for result in algorithm.results)
+    assert all(result.failure_reason == "Solve or result acquisition failed" for result in algorithm.results)
     history_lines = (tmp_path / "run" / "opt_history.csv").read_text(encoding="utf-8").splitlines()
     assert len(history_lines) == 1
 
@@ -740,7 +741,7 @@ def test_run_task_defaults_to_algorithm_aware_fitness_for_new_runs(monkeypatch, 
 
     assert exit_code == 0
     assert captured["kwargs"]["objective_mode"] == "algorithm_aware"
-    assert captured["kwargs"]["fitness_config"]["single_objective_strategy"] == "bo"
+    assert captured["kwargs"]["fitness_config"]["scalarization"] == "weighted_metrics"
     assert captured["kwargs"]["fitness_config"]["adaptive_penalty"] is False
 
 
@@ -841,7 +842,7 @@ def test_run_task_executes_opt_with_bo(monkeypatch, tmp_path):
     assert "bo_pred_mean" in history_header
 
 
-def test_load_manual_bo_history_filters_incompatible_and_out_of_bounds_rows(tmp_path):
+def test_load_manual_bo_history_rejects_legacy_cost_only_csv(tmp_path):
     from optimizer.algorithms.bo import BOOptimizer
     from optimizer.core.parameter import ParameterManager
 
@@ -924,14 +925,12 @@ def test_load_manual_bo_history_filters_incompatible_and_out_of_bounds_rows(tmp_
 
     summary = task_runner._load_manual_bo_history(config, algorithm, param_mgr)
 
-    assert summary["loaded"] == 1
-    assert summary["skipped_out_of_bounds"] == 1
-    assert summary["rejected_sources"] == 0
-    assert algorithm.history_loaded_count == 1
-    assert algorithm.X_train.shape == (1, 2)
-    assert np.allclose(algorithm.X_train[0], np.array([0.1, 0.2]))
-    assert algorithm.y_train.tolist() == [1.25]
-    assert config["algorithm"]["history_loaded"] == 1
+    assert summary["loaded"] == 0
+    assert summary["rejected_sources"] == 1
+    assert "unverified" in summary["rejections"][0]["reason"]
+    assert algorithm.history_loaded_count == 0
+    assert algorithm.X_train.shape == (0, 2)
+    assert config["algorithm"]["history_loaded"] == 0
 
 
 def test_load_manual_bo_history_rejects_incompatible_target(tmp_path):

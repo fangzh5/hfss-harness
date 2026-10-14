@@ -72,7 +72,7 @@ class PSOOptimizer(OptimizationAlgorithm):
     def update(self, fitness_results: List):
         """更新粒子群状态"""
         for result in fitness_results:
-            if not hasattr(result, 'cost'):
+            if not getattr(result, 'valid', True) or not hasattr(result, 'cost') or not np.isfinite(result.cost):
                 continue
             cost = result.cost
             idx = getattr(result, 'particle_idx', 0)
@@ -105,7 +105,8 @@ class PSOOptimizer(OptimizationAlgorithm):
             max_vel = self.step_size * 2
 
         for i in range(self.n_dims):
-            self.velocities[:, i] = np.clip(self.velocities[:, i], -max_vel[i], max_vel[i])
+            limit = float(max_vel) if np.ndim(max_vel) == 0 else max_vel[i]
+            self.velocities[:, i] = np.clip(self.velocities[:, i], -limit, limit)
 
     def _update_positions(self):
         """更新粒子位置"""

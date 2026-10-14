@@ -29,6 +29,7 @@ try:
         task_results_file_name,
     )
     from ..task_config import normalize_task_type
+    from ..result_records import pareto_front_for_json
 except ImportError:  # pragma: no cover
     from output_names import (
         task_dashboard_control_file_name,
@@ -39,6 +40,7 @@ except ImportError:  # pragma: no cover
         task_results_file_name,
     )
     from task_config import normalize_task_type
+    from result_records import pareto_front_for_json
 
 
 def _format_duration(seconds: float) -> str:
@@ -353,7 +355,7 @@ def build_dashboard_snapshot(
     events = events or []
     control = control or {}
     optimization_mode = "multi_objective" if _is_multi_objective_config(target) else "single_objective"
-    pareto_front = list(pareto_front or []) if optimization_mode == "multi_objective" else []
+    pareto_front = pareto_front_for_json(pareto_front) if optimization_mode == "multi_objective" else []
 
     project_path = hfss.get("project_path")
     source_name = Path(project_path).stem if project_path else "N/A"

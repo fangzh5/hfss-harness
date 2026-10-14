@@ -4,7 +4,7 @@
   "optimization": {
     "work_dir": "../temp",
     "save_best_on_exit": false,
-    "save_interval": 1
+    "keep_working_copy": false
   },
   "launch": {
     "dashboard": true,
@@ -13,16 +13,18 @@
     "dashboard_port": 8765
   },
   "study": {
+    "mode": "oat",
+    "max_cases": 3,
     "freq_band": [
-      55,
-      66
+      59,
+      61
     ],
     "s11_threshold": -10,
     "variables": [
       {
         "name": "patch_x",
-        "start": 0.9,
-        "stop": 1.0,
+        "start": 1.0,
+        "stop": 1.02,
         "step": 0.01
       }
     ]
@@ -35,12 +37,19 @@
       "sweep_name": "Sweep",
       "new_desktop": true,
       "non_graphical": true,
-      "close_projects": 0,
-      "close_desktop": 0,
+      "close_projects": true,
+      "close_desktop": true,
       "results": {
         "s11": "dB(S(1,1))",
         "freq_unit": "GHz"
-      }
+      },
+      "aedt_version": "2023.2",
+      "use_grpc_api": false,
+      "expected_freq_band": [
+        55,
+        65
+      ],
+      "min_band_points": 41
     }
   },
   "output": {

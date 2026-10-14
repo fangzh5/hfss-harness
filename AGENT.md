@@ -5,6 +5,7 @@
 ## 启动入口
 
 - 唯一允许的任务入口：`python optimizer\cli.py <config>`
+- 安装包创建的工作目录没有源码子目录，使用同一入口的模块形式：`python -m optimizer.cli <config>`（或console script `hfss-harness <config>`）。
 - 默认启动命令：`python optimizer\cli.py <config> --dashboard --dashboard-browser`
 - 静默启动命令：`python optimizer\cli.py <config> --silent --no-dashboard --no-dashboard-browser`
 - 不要使用 `optimizer/main.py` 或 `optimizer/run_optimizer.py` 作为启动入口。
@@ -26,7 +27,6 @@
 ## 按需阅读
 
 - `README.md`
-  - 需要查看环境安装、快速开始、默认启动方式、单目标默认行为时再读
+  - 源码checkout需要查看安装/快速开始时再读；安装包生成的工作目录改读 `docs/migration-0.2.0.md`。
 - `docs/agent-reference.md`
   - 需要查看更细的任务字段、任务类型差异、输出文件、实现要点时再读
-

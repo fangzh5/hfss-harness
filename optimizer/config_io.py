@@ -16,7 +16,16 @@ def load_config(config_path: str | Path, base_dir: str | Path | None = None) -> 
     """Load a JSON config file."""
     resolved = resolve_config_path(str(config_path), base_dir)
     with open(resolved, "r", encoding="utf-8") as fp:
-        return json.load(fp)
+        config = json.load(fp)
+    # Pin the source before CLI path planning or adapter construction. Installed
+    # workspaces must not resolve their project against site-packages/optimizer.
+    if isinstance(config, dict):
+        simulator = config.get("simulator")
+        hfss = simulator.get("hfss") if isinstance(simulator, dict) else None
+        project = hfss.get("project_path") if isinstance(hfss, dict) else None
+        if isinstance(project, str) and project and not Path(project).is_absolute():
+            hfss["project_path"] = str((resolved.parent / project).resolve())
+    return config
 
 
 def save_config_snapshot(output_dir: str | Path, config: dict[str, Any]) -> Path:

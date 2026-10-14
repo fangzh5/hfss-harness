@@ -5,11 +5,12 @@
     "work_dir": "../temp",
     "project_suffix": "_work",
     "save_best_on_exit": true,
-    "save_interval": 1,
+    "save_interval": 10,
     "initial_point": [
       1.01,
-      0.25
-    ]
+      1.37
+    ],
+    "keep_working_copy": false
   },
   "launch": {
     "dashboard": true,
@@ -19,19 +20,18 @@
   },
   "parameters": [
     {
-      "name": "patch_w",
-      "min": 0.8585,
-      "max": 1.1615,
+      "name": "patch_x",
+      "min": 0.9,
+      "max": 1.5,
       "unit": "mm",
       "resolution": 0.01
     },
     {
-      "name": "probe_p",
-      "min": 0.1,
-      "max": 0.58075,
+      "name": "patch_y",
+      "min": 1.3,
+      "max": 1.65,
       "unit": "mm",
-      "resolution": 0.01,
-      "constraint": "probe_p <= patch_w / 2"
+      "resolution": 0.01
     }
   ],
   "target": {
@@ -39,7 +39,7 @@
       59,
       61
     ],
-    "s11_threshold": -15,
+    "s11_threshold": -10,
     "bandwidth_target": null,
     "gain_min": null
   },
@@ -66,12 +66,19 @@
       "sweep_name": "Sweep",
       "new_desktop": true,
       "non_graphical": true,
-      "close_projects": 0,
-      "close_desktop": 0,
+      "close_projects": true,
+      "close_desktop": true,
       "results": {
         "s11": "dB(S(1,1))",
         "freq_unit": "GHz"
-      }
+      },
+      "aedt_version": "2023.2",
+      "use_grpc_api": false,
+      "expected_freq_band": [
+        55,
+        65
+      ],
+      "min_band_points": 41
     }
   },
   "output": {

@@ -5,6 +5,22 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 import numpy as np
+import math
+
+
+def pareto_front_for_json(front):
+    """Preserve NSGA boundary meaning without non-standard JSON Infinity."""
+    rows = []
+    for item in front or []:
+        row = dict(item)
+        distance = row.get("crowding_distance")
+        if distance is not None and not math.isfinite(float(distance)):
+            if float(distance) != math.inf:
+                raise ValueError("Invalid Pareto crowding distance")
+            row["crowding_distance"] = None
+            row["crowding_unbounded"] = True
+        rows.append(row)
+    return rows
 
 
 def _to_float_list(values: Any) -> list[float]:
@@ -139,6 +155,12 @@ def build_far_field_simulation_record(far_field: dict[str, Any]) -> dict[str, An
         payload["cuts"] = {plane_id: {"gain_db": values} for plane_id, values in cuts.items() if values}
     if any_peak:
         payload["global_peak"] = global_peak
+    coverage = [{"frequency": item.get("frequency"), "peak_scope": item.get("peak_scope"),
+                 "acquisition": item.get("acquisition"),
+                 "sampled_peak_direction": item.get("sampled_peak_direction")}
+                for item in per_frequency if isinstance(item, dict) and item.get("acquisition")]
+    if coverage:
+        payload["coverage"] = coverage
     summary = far_field.get("summary")
     if isinstance(summary, dict) and summary:
         payload["summary"] = summary
@@ -176,5 +198,13 @@ def build_simulation_record(
     far_field_record = build_far_field_simulation_record(far_field) if isinstance(far_field, dict) else None
     if far_field_record is not None:
         record["far_field"] = far_field_record
+
+    traces = extra_metrics.get("traces") if isinstance(extra_metrics, dict) else None
+    if isinstance(traces, dict) and traces:
+        record["traces"] = traces
+    if isinstance(extra_metrics, dict) and extra_metrics.get("result_bundle") is not None:
+        record["result_bundle"] = extra_metrics["result_bundle"]
+    if isinstance(params, dict):
+        record["parameter_expressions"] = {str(name): str(value) for name, value in params.items()}
 
     return record

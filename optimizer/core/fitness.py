@@ -5,6 +5,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+try:
+    from ..results import frequency_to_ghz, TraceData
+except ImportError:  # pragma: no cover - historical script import path
+    from results import frequency_to_ghz, TraceData
+
 
 @dataclass
 class FitnessResult:
@@ -28,6 +33,8 @@ class FitnessResult:
     rank: Optional[int] = None
     crowding_distance: Optional[float] = None
     source_sim_id: Optional[int] = None
+    valid: bool = True
+    failure_reason: Optional[str] = None
 
     @property
     def s21_max(self) -> Optional[float]:
@@ -50,6 +57,7 @@ class FitnessStage:
     gain_target: Optional[float] = None
     center_priority: bool = False
     s11_profile: Optional[Dict[str, Any]] = None
+    s11_lower_bands: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def s21_target(self) -> Optional[float]:
@@ -85,6 +93,7 @@ class FitnessCalculator:
         fitness_config: Optional[dict] = None,
         multi_objective_config: Optional[dict] = None,
         s11_profile: Optional[dict] = None,
+        s11_lower_bands: Optional[List[dict]] = None,
     ):
         self.objective_mode = str(objective_mode or "legacy").lower()
         self.fitness_config = fitness_config or {}
@@ -105,7 +114,21 @@ class FitnessCalculator:
             gain_target=gain_target,
             stages=stages,
             s11_profile=s11_profile,
+            s11_lower_bands=s11_lower_bands,
         )
+        for stage in self.stages:
+            if len(stage.freq_band) != 2 or not np.all(np.isfinite(stage.freq_band)) or (
+                stage.freq_band[0] < 0 or stage.freq_band[1] < stage.freq_band[0]
+            ):
+                raise ValueError("Stage frequency bands must be finite and ordered")
+            thresholds = [stage.s11_target, stage.s12_target, stage.gain_target, stage.bandwidth_target]
+            if any(value is not None and not np.isfinite(float(value)) for value in thresholds):
+                raise ValueError("Stage thresholds must be finite")
+        for key in ("frequency_tolerance_ghz", "max_frequency_gap_ghz"):
+            if key in self.fitness_config:
+                value = float(self.fitness_config[key])
+                if not np.isfinite(value) or value <= 0:
+                    raise ValueError(f"{key} must be finite and positive")
         self.stage_index = 0
         self._refresh_active_stage()
 
@@ -122,6 +145,7 @@ class FitnessCalculator:
         gain_target: Optional[float],
         stages: Optional[List[dict]],
         s11_profile: Optional[dict],
+        s11_lower_bands: Optional[List[dict]],
     ) -> List[FitnessStage]:
         if not stages:
             return [
@@ -134,6 +158,7 @@ class FitnessCalculator:
                     gain_target=gain_target,
                     center_priority=False,
                     s11_profile=self._normalize_s11_profile(s11_profile, s11_target),
+                    s11_lower_bands=self._normalize_s11_lower_bands(s11_lower_bands),
                 )
             ]
 
@@ -152,6 +177,9 @@ class FitnessCalculator:
                     gain_target=stage_cfg.get("gain_min", stage_cfg.get("gain_target", gain_target)),
                     center_priority=bool(stage_cfg.get("center_priority", False)),
                     s11_profile=self._normalize_s11_profile(stage_cfg.get("s11_profile", s11_profile), s11_target),
+                    s11_lower_bands=self._normalize_s11_lower_bands(
+                        stage_cfg.get("s11_lower_bands", s11_lower_bands)
+                    ),
                 )
             )
 
@@ -278,6 +306,7 @@ class FitnessCalculator:
             "peak_loss_threshold": None,
             "pointing_error_threshold": None,
             "s11_profile": None,
+            "objectives_explicit": False,
         }
         if raw_cfg is None:
             return default
@@ -313,20 +342,27 @@ class FitnessCalculator:
             pass
         cfg["s11_profile"] = self._normalize_s11_profile(raw_cfg.get("s11_profile"), None)
 
+        raw_objectives = raw_cfg.get("objectives", [])
+        cfg["objectives_explicit"] = isinstance(raw_objectives, list) and bool(raw_objectives)
         objectives = []
-        for item in raw_cfg.get("objectives", []):
+        for item in raw_objectives:
             if not isinstance(item, dict):
                 continue
             obj_type = str(item.get("type", item.get("name", ""))).strip().lower()
             if not obj_type:
                 continue
-            objectives.append(
-                {
-                    "name": str(item.get("name", obj_type)),
-                    "type": obj_type,
-                    "tail_ratio": float(item.get("tail_ratio", cfg["tail_ratio"])),
-                }
-            )
+            objective = {
+                "name": str(item.get("name", obj_type)),
+                "type": obj_type,
+                "tail_ratio": float(item.get("tail_ratio", cfg["tail_ratio"])),
+                "target": item.get("target"),
+            }
+            if item.get("constraint_max") is not None:
+                try:
+                    objective["constraint_max"] = float(item["constraint_max"])
+                except (TypeError, ValueError):
+                    pass
+            objectives.append(objective)
         if cfg["enabled"] and not objectives:
             if cfg["pointing_error_threshold"] is not None:
                 objectives = [
@@ -378,6 +414,46 @@ class FitnessCalculator:
         profile["edge_points"] = edge_points
         return profile
 
+    @staticmethod
+    def _normalize_s11_lower_bands(raw_cfg: Any) -> List[Dict[str, Any]]:
+        """Normalize optional reverse-S11 bands (S11 must remain above a limit)."""
+        if raw_cfg is None:
+            return []
+        if not isinstance(raw_cfg, (list, tuple)):
+            raise ValueError("s11_lower_bands must be a list of band definitions.")
+
+        bands: List[Dict[str, Any]] = []
+        for index, item in enumerate(raw_cfg, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"s11_lower_bands[{index - 1}] must be an object.")
+            raw_band = item.get("freq_band")
+            if not isinstance(raw_band, (list, tuple)) or len(raw_band) != 2:
+                raise ValueError(f"s11_lower_bands[{index - 1}].freq_band must contain two frequencies.")
+            try:
+                start, stop = float(raw_band[0]), float(raw_band[1])
+                threshold = float(item["threshold"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"s11_lower_bands[{index - 1}] requires numeric freq_band and threshold values."
+                ) from exc
+            if not np.isfinite(start) or not np.isfinite(stop) or not np.isfinite(threshold) or stop < start:
+                raise ValueError(f"s11_lower_bands[{index - 1}] has an invalid frequency band or threshold.")
+            strict_raw = item.get("strict", False)
+            strict = (
+                strict_raw.strip().lower() in {"1", "true", "yes", "on"}
+                if isinstance(strict_raw, str)
+                else bool(strict_raw)
+            )
+            bands.append(
+                {
+                    "name": str(item.get("name", f"lower_band_{index}")),
+                    "freq_band": (start, stop),
+                    "threshold": threshold,
+                    "strict": strict,
+                }
+            )
+        return bands
+
     def _s11_threshold_array(self, stage: FitnessStage, freqs_ghz: np.ndarray) -> np.ndarray:
         thresholds = np.full(freqs_ghz.shape, float(stage.s11_target), dtype=float)
         profile = stage.s11_profile or self.multi_objective_config.get("s11_profile")
@@ -400,30 +476,214 @@ class FitnessCalculator:
                 thresholds[edge_mask] = threshold
         return thresholds
 
+    def _lower_s11_summary(
+        self,
+        stage: FitnessStage,
+        freqs: np.ndarray,
+        s11: np.ndarray,
+    ) -> Dict[str, Any]:
+        """Summarize reverse-S11 constraints without diluting them by point count."""
+        bands = stage.s11_lower_bands or []
+        if not bands:
+            return {
+                "violation_raw": 0.0,
+                "deficit_mean": 0.0,
+                "deficit_max": 0.0,
+                "missing_bands": 0,
+                "point_count": 0,
+                "feasible": True,
+                "per_band": [],
+            }
+
+        f_ghz = self._normalize_frequency(np.asarray(freqs, dtype=float))
+        s11_values = np.asarray(s11, dtype=float)
+        band_scores: List[float] = []
+        all_deficits: List[np.ndarray] = []
+        per_band: List[Dict[str, Any]] = []
+        missing_bands = 0
+        feasible = True
+
+        for band in bands:
+            start, stop = band["freq_band"]
+            threshold = float(band["threshold"])
+            strict = bool(band.get("strict", False))
+            mask = (f_ghz >= start) & (f_ghz <= stop)
+            if not np.any(mask):
+                missing_bands += 1
+                feasible = False
+                per_band.append(
+                    {
+                        "name": band["name"],
+                        "freq_band": [start, stop],
+                        "threshold": threshold,
+                        "strict": strict,
+                        "point_count": 0,
+                        "feasible": False,
+                        "missing": True,
+                    }
+                )
+                continue
+
+            values = s11_values[mask]
+            deficits = np.clip(threshold - values, 0.0, None)
+            if strict:
+                failed = values <= threshold
+                # A tiny nonzero deficit keeps an exact threshold value from
+                # appearing cost-free when the user requested a strict bound.
+                deficits = np.where(failed, np.maximum(deficits, 1e-6), deficits)
+            else:
+                failed = values < threshold - 1e-12
+
+            band_feasible = not bool(np.any(failed))
+            feasible = feasible and band_feasible
+            score = float(np.mean(np.square(deficits)) * 20.0 + np.mean(deficits) * 2.0)
+            band_scores.append(score)
+            all_deficits.append(deficits)
+            per_band.append(
+                {
+                    "name": band["name"],
+                    "freq_band": [start, stop],
+                    "threshold": threshold,
+                    "strict": strict,
+                    "point_count": int(values.size),
+                    "min_s11": float(np.min(values)),
+                    "deficit_mean": float(np.mean(deficits)),
+                    "deficit_max": float(np.max(deficits)),
+                    "feasible": band_feasible,
+                    "missing": False,
+                }
+            )
+
+        if missing_bands:
+            violation_raw = 9999.0
+        else:
+            violation_raw = float(np.mean(band_scores)) if band_scores else 0.0
+        flattened = np.concatenate(all_deficits) if all_deficits else np.array([], dtype=float)
+        return {
+            "violation_raw": violation_raw,
+            "deficit_mean": float(np.mean(flattened)) if flattened.size else 0.0,
+            "deficit_max": float(np.max(flattened)) if flattened.size else 0.0,
+            "missing_bands": missing_bands,
+            "point_count": int(flattened.size),
+            "feasible": feasible,
+            "per_band": per_band,
+        }
+
     def calculate(
         self,
         freqs: np.ndarray,
         s11: np.ndarray,
         gain: Optional[np.ndarray] = None,
         extra_metrics: Optional[Dict[str, Any]] = None,
+        *, frequency_unit: str = "GHz",
     ) -> FitnessResult:
         """Calculate fitness from available traces."""
+        try:
+            freqs = frequency_to_ghz(freqs, frequency_unit)
+        except (TypeError, ValueError) as exc:
+            return self._invalid_result(str(exc), extra_metrics)
         if self.is_multi_objective:
             return self.calculate_multiobjective(freqs, s11, gain, extra_metrics=extra_metrics)
         stage = self.active_stage
         extra_metrics = extra_metrics or {}
         if stage.s12_target is not None:
             if gain is None:
-                return FitnessResult(
-                    cost=9999.0,
-                    target_met=False,
-                    stage_met=False,
-                    stage_index=self.stage_index,
-                    stage_name=stage.name,
-                    extra_metrics=extra_metrics,
-                )
+                return self._invalid_result("Required isolation trace is missing", extra_metrics)
             return self.calculate_with_s21(freqs, s11, gain, extra_metrics=extra_metrics)
         return self.calculate_s11(freqs, s11, extra_metrics=extra_metrics)
+
+    def _invalid_result(self, reason, extra_metrics=None, *, freqs=None, s11=None):
+        metrics = dict(extra_metrics or {})
+        metrics["data_quality"] = {"valid": False, "reason": reason}
+        raw = {}
+        if self.active_stage.s11_lower_bands and freqs is not None and s11 is not None:
+            try:
+                trace = TraceData("S11", freqs, s11)
+                lower = self._lower_s11_summary(self.active_stage, trace.frequencies_ghz, trace.values)
+                raw = {"lower_s11_missing_bands_raw": float(lower["missing_bands"]),
+                       "lower_s11_violation_raw": float(lower["violation_raw"])}
+                metrics["lower_s11_bands"] = lower["per_band"]
+            except (TypeError, ValueError):
+                pass
+        return FitnessResult(cost=1e12, valid=False, failure_reason=reason,
+            target_met=False, stage_met=False, stage_index=self.stage_index,
+            stage_name=self.active_stage.name, extra_metrics=metrics, raw_metrics=raw,
+            objectives=[1e12 for _ in self.multi_objective_config.get("objectives", [])]
+                if self.is_multi_objective else [], constraint_violation=1e12)
+
+    def _data_error(self, freqs, s11, isolation=None):
+        try:
+            trace = TraceData("S11", freqs, s11)
+            if isolation is not None:
+                TraceData("isolation", freqs, isolation)
+            axis = trace.frequencies_ghz
+            tolerance = float(self.fitness_config.get("frequency_tolerance_ghz", 1e-8))
+            bands = [self.active_stage.freq_band] + [
+                band["freq_band"] for band in self.active_stage.s11_lower_bands]
+            for low, high in bands:
+                if axis[0] > low + tolerance or axis[-1] < high - tolerance:
+                    return f"Frequency axis does not cover required band {low:g}-{high:g} GHz"
+            max_gap = self.fitness_config.get("max_frequency_gap_ghz")
+            if max_gap is not None and np.any(np.diff(axis) > float(max_gap) + tolerance):
+                return "Frequency sampling exceeds configured maximum gap"
+            profile = self.active_stage.s11_profile or {}
+            for point in profile.get("edge_points", []):
+                if np.min(np.abs(axis - point["freq"])) > profile.get("freq_tolerance", tolerance):
+                    return f"Missing configured edge sample {point['freq']:g} GHz"
+        except (ValueError, TypeError) as exc:
+            return str(exc)
+        return None
+
+    def _extra_error(self, extra_metrics):
+        if self.active_stage.gain_target is not None and self._band_peak_gain(extra_metrics) is None:
+            return "Required peak gain has invalid or incomplete frequency/angular coverage"
+        if not self.is_multi_objective or not self.multi_objective_config.get("objectives_explicit"):
+            return None
+        points = (extra_metrics.get("far_field") or {}).get("per_frequency") or []
+        for objective in self.multi_objective_config.get("objectives", []):
+            kind = objective["type"]
+            series = None
+            if kind.startswith("peak_gain"):
+                if self._band_peak_gain(extra_metrics) is None:
+                    return "Required peak gain data is missing or invalid"
+            elif kind.startswith("boresight_gain"):
+                series = self._boresight_gain_series(extra_metrics)
+            elif kind.startswith("peak_loss"):
+                series = self._peak_loss_series(extra_metrics)
+            elif kind.startswith("pointing_error"):
+                series = self._pointing_error_series(extra_metrics)
+            if series is not None and (
+                not series or len(series) != len(points) or not np.all(np.isfinite(series))
+            ):
+                return f"Required {kind} data is missing or invalid"
+            if kind.startswith(("peak_loss", "pointing_error")):
+                if any(point.get("peak_scope") == "principal_cuts" for point in points):
+                    return "Global far-field objective cannot use principal cuts"
+        return None
+
+    def _band_peak_gain(self, extra_metrics: Dict[str, Any]) -> Optional[float]:
+        """Return the worst sampled peak gain only for a covered, finite band."""
+        far_field = extra_metrics.get("far_field") or {}
+        points = far_field.get("per_frequency") or []
+        low, high = self.active_stage.freq_band
+        samples = []
+        try:
+            for point in points:
+                acquisition = point.get("acquisition") or {}
+                if acquisition and acquisition.get("angular_scope") != "sampled_sphere":
+                    return None
+                frequency = float(str(point["frequency"]).replace("GHz", ""))
+                if low - 1e-8 <= frequency <= high + 1e-8:
+                    peak = point.get("global_peak_direction") or point.get("peak_direction") or {}
+                    value = float(peak["gain_db"])
+                    if not np.isfinite(value):
+                        return None
+                    samples.append((frequency, value))
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not samples or min(f for f, _ in samples) > low + 1e-8 or max(f for f, _ in samples) < high - 1e-8:
+            return None
+        return min(value for _, value in samples)
 
     def calculate_s11(
         self,
@@ -434,6 +694,9 @@ class FitnessCalculator:
         """Calculate fitness using S11 only."""
         stage = self.active_stage
         extra_metrics = dict(extra_metrics or {})
+        error = self._data_error(freqs, s11) or self._extra_error(extra_metrics)
+        if error:
+            return self._invalid_result(error, extra_metrics, freqs=freqs, s11=s11)
         f_ghz = self._normalize_frequency(freqs)
         mask = (f_ghz >= stage.freq_band[0]) & (f_ghz <= stage.freq_band[1])
 
@@ -450,6 +713,7 @@ class FitnessCalculator:
         band_freqs = f_ghz[mask]
         band_s11 = np.asarray(s11, dtype=float)[mask]
         s11_max = float(np.max(band_s11))
+        gain_min = self._band_peak_gain(extra_metrics) if stage.gain_target is not None else None
         extracted = self._extract_metrics_with_segment(
             freqs=f_ghz,
             s11=np.asarray(s11, dtype=float),
@@ -459,6 +723,10 @@ class FitnessCalculator:
         segment = extracted.segment
         bandwidth = extracted.metrics["matched_bandwidth"]
         extra_metrics["fitness_metrics"] = dict(extracted.metrics)
+        if stage.s11_lower_bands:
+            extra_metrics["lower_s11_bands"] = self._lower_s11_summary(
+                stage, f_ghz, np.asarray(s11, dtype=float)
+            )["per_band"]
 
         cost, component_costs, raw_metrics = self._compute_cost(
             stage=stage,
@@ -467,10 +735,10 @@ class FitnessCalculator:
             bandwidth=bandwidth,
             segment=segment,
             s21=None,
-            gain_min=None,
+            gain_min=gain_min,
             extra_metrics=extra_metrics,
         )
-        stage_met = self.is_target_met(stage, band_freqs, band_s11, bandwidth, None)
+        stage_met = self.is_target_met(stage, f_ghz, np.asarray(s11, dtype=float), bandwidth, gain_min)
 
         adaptive_scales = self._finalize_adaptive_scales(raw_metrics)
 
@@ -479,7 +747,7 @@ class FitnessCalculator:
             bandwidth=bandwidth,
             s11_max=s11_max,
             s12_max=None,
-            gain_min=None,
+            gain_min=gain_min,
             target_met=stage_met and self.is_final_stage,
             stage_met=stage_met,
             stage_index=self.stage_index,
@@ -516,6 +784,8 @@ class FitnessCalculator:
         band_thresholds = self._s11_threshold_array(stage, f_ghz[band_mask])
         excess = np.clip(band_s11 - band_thresholds, 0.0, None)
         s11_violation = float(np.mean(np.square(excess)) * 20.0 + np.mean(excess) * 2.0) if excess.size else 0.0
+        lower_summary = self._lower_s11_summary(stage, f_ghz, s11)
+        lower_s11_violation = float(lower_summary["violation_raw"])
 
         bw_target = self._get_bandwidth_target_for_cost(stage)
         bandwidth_gap = max(float(bw_target) - float(bandwidth or 0.0), 0.0) if bw_target is not None else 0.0
@@ -551,13 +821,24 @@ class FitnessCalculator:
                 )
                 pointing_error_violation = float(np.max(excess)) if excess.size else 0.0
 
-        return s11_violation + bandwidth_violation + s12_violation + peak_loss_violation + pointing_error_violation, {
+        total_violation = (
+            s11_violation
+            + lower_s11_violation
+            + bandwidth_violation
+            + s12_violation
+            + peak_loss_violation
+            + pointing_error_violation
+        )
+        details = {
             "s11_violation": s11_violation,
             "bandwidth_gap": bandwidth_gap,
             "s12_violation": s12_violation,
             "peak_loss_violation": peak_loss_violation,
             "pointing_error_violation": pointing_error_violation,
         }
+        if stage.s11_lower_bands:
+            details["lower_s11_violation"] = lower_s11_violation
+        return total_violation, details
 
     @staticmethod
     def _peak_loss_series(extra_metrics: Dict[str, Any]) -> list[float]:
@@ -583,6 +864,18 @@ class FitnessCalculator:
                 continue
         return series
 
+
+    @staticmethod
+    def _boresight_gain_series(extra_metrics: Dict[str, Any]) -> list[float]:
+        far_field = extra_metrics.get("far_field", {})
+        per_frequency = far_field.get("per_frequency", []) if isinstance(far_field, dict) else []
+        series = []
+        for item in per_frequency:
+            try:
+                series.append(float(item.get("boresight_grid_point", {}).get("gain_db")))
+            except Exception:
+                continue
+        return series
     @staticmethod
     def _tail_mean(values: list[float], tail_ratio: float) -> float:
         if not values:
@@ -600,6 +893,7 @@ class FitnessCalculator:
         s12_values = sorted(np.asarray(band_s12, dtype=float).tolist()) if band_s12 is not None else []
         peak_losses = sorted(self._peak_loss_series(extra_metrics))
         pointing_errors = sorted(self._pointing_error_series(extra_metrics))
+        boresight_gains = self._boresight_gain_series(extra_metrics)
         metrics: Dict[str, float] = {}
         objectives: List[float] = []
 
@@ -608,6 +902,9 @@ class FitnessCalculator:
             tail_ratio = float(objective_cfg.get("tail_ratio", self.multi_objective_config.get("tail_ratio", 0.25)))
             if obj_type == "s11_worst":
                 value = float(max(s11_values)) if s11_values else 9999.0
+            elif obj_type == "peak_gain_min":
+                gain_min = self._band_peak_gain(extra_metrics)
+                value = -gain_min if gain_min is not None else 9999.0
             elif obj_type == "s11_avg":
                 value = float(np.mean(s11_values)) if s11_values else 9999.0
             elif obj_type == "s11_cvar":
@@ -632,6 +929,14 @@ class FitnessCalculator:
                 value = self._tail_mean(pointing_errors, tail_ratio)
             elif obj_type == "s11_violation":
                 value = float(extra_metrics.get("constraint_details", {}).get("s11_violation", 9999.0))
+            elif obj_type in {"boresight_gain_target_abs", "boresight_gain_avg_target_abs"}:
+                target = objective_cfg.get("target")
+                target_value = 6.0 if target is None else float(target)
+                value = float(np.mean(np.abs(np.asarray(boresight_gains, dtype=float) - target_value))) if boresight_gains else 9999.0
+            elif obj_type == "boresight_gain_worst_target_abs":
+                target = objective_cfg.get("target")
+                target_value = 6.0 if target is None else float(target)
+                value = float(np.max(np.abs(np.asarray(boresight_gains, dtype=float) - target_value))) if boresight_gains else 9999.0
             elif obj_type in {"s12_violation", "s21_violation"}:
                 value = float(extra_metrics.get("constraint_details", {}).get("s12_violation", 9999.0))
             else:
@@ -640,6 +945,25 @@ class FitnessCalculator:
             objectives.append(value)
             metrics[objective_cfg["name"]] = value
         return objectives, metrics
+
+    def _objective_constraint_violations(self, objective_metrics: Dict[str, float]) -> Dict[str, float]:
+        """Return upper-bound violations declared on explicit objectives."""
+        violations: Dict[str, float] = {}
+        for objective_cfg in self.multi_objective_config.get("objectives", []):
+            limit = objective_cfg.get("constraint_max")
+            if limit is None:
+                continue
+            name = str(objective_cfg.get("name", objective_cfg.get("type", "objective")))
+            try:
+                value = float(objective_metrics.get(name, 9999.0))
+                limit_value = float(limit)
+            except (TypeError, ValueError):
+                value = 9999.0
+                limit_value = 0.0
+            if not np.isfinite(value):
+                value = 9999.0
+            violations[f"{name}_violation"] = max(value - limit_value, 0.0)
+        return violations
 
     def calculate_multiobjective(
         self,
@@ -651,6 +975,9 @@ class FitnessCalculator:
         """Calculate Pareto-oriented objectives while preserving scalar logging fields."""
         stage = self.active_stage
         extra_metrics = dict(extra_metrics or {})
+        error = self._data_error(freqs, s11, gain) or self._extra_error(extra_metrics)
+        if error:
+            return self._invalid_result(error, extra_metrics, freqs=freqs, s11=s11)
         f_ghz = self._normalize_frequency(freqs)
         mask = (f_ghz >= stage.freq_band[0]) & (f_ghz <= stage.freq_band[1])
 
@@ -680,26 +1007,45 @@ class FitnessCalculator:
         metrics = dict(extracted.metrics)
         bandwidth = metrics["matched_bandwidth"]
         extra_metrics["fitness_metrics"] = dict(metrics)
+        if stage.s11_lower_bands:
+            extra_metrics["lower_s11_bands"] = self._lower_s11_summary(
+                stage, f_ghz, np.asarray(s11, dtype=float)
+            )["per_band"]
 
-        objectives = self.objectives_for_nsga2(metrics)
         constraint_details = self.constraints_for_nsga2(metrics)
+        extra_metrics["constraint_details"] = constraint_details
+        if self.multi_objective_config.get("objectives_explicit", False):
+            objectives, objective_metrics = self._build_multi_objectives(band_s11, band_s12, extra_metrics)
+        else:
+            objectives = self.objectives_for_nsga2(metrics)
+            objective_metrics = {
+                "inband_violation_max": float(metrics["inband_violation_max"]),
+                "edge_violation_max": float(metrics["edge_violation_max"]),
+                "negative_depth_mean": -float(metrics["depth_mean"]),
+            }
+        objective_constraint_details = self._objective_constraint_violations(objective_metrics)
+        constraint_details.update(objective_constraint_details)
         constraint_violation = float(sum(constraint_details.values()))
         extra_metrics["constraint_details"] = constraint_details
-        extra_metrics["objective_metrics"] = {
-            "inband_violation_max": float(metrics["inband_violation_max"]),
-            "edge_violation_max": float(metrics["edge_violation_max"]),
-            "negative_depth_mean": -float(metrics["depth_mean"]),
-        }
+        extra_metrics["objective_metrics"] = objective_metrics
 
         display_cost = float(constraint_violation + sum(objectives))
-        stage_met = self.is_target_met(stage, band_freqs, band_s11, bandwidth, s12_max)
+        if not np.isfinite(display_cost) or not np.all(np.isfinite(objectives)):
+            return self._invalid_result("Objective metrics contain NaN/Inf", extra_metrics)
+        gain_min = self._band_peak_gain(extra_metrics) if stage.gain_target is not None else None
+        stage_met = self.is_target_met(stage, f_ghz, np.asarray(s11, dtype=float), bandwidth,
+                                       gain_min, s12_max=s12_max)
+        stage_met = stage_met and constraint_violation <= 1e-12
+        if objective_constraint_details:
+            stage_met = stage_met and all(value <= 1e-12 for value in objective_constraint_details.values())
 
         return FitnessResult(
             cost=display_cost,
             bandwidth=bandwidth,
             s11_max=s11_max,
             s12_max=s12_max,
-            target_met=False,
+            target_met=bool(stage_met and self.is_final_stage),
+            gain_min=gain_min,
             stage_met=stage_met,
             stage_index=self.stage_index,
             stage_name=stage.name,
@@ -721,6 +1067,9 @@ class FitnessCalculator:
         """Calculate fitness using S11 and S12 isolation."""
         stage = self.active_stage
         extra_metrics = dict(extra_metrics or {})
+        error = self._data_error(freqs, s11, s21) or self._extra_error(extra_metrics)
+        if error:
+            return self._invalid_result(error, extra_metrics, freqs=freqs, s11=s11)
         f_ghz = self._normalize_frequency(freqs)
         mask = (f_ghz >= stage.freq_band[0]) & (f_ghz <= stage.freq_band[1])
 
@@ -740,6 +1089,7 @@ class FitnessCalculator:
 
         s11_max = float(np.max(band_s11))
         s21_max = float(np.max(band_s21))
+        gain_min = self._band_peak_gain(extra_metrics) if stage.gain_target is not None else None
 
         extracted = self._extract_metrics_with_segment(
             freqs=f_ghz,
@@ -750,6 +1100,10 @@ class FitnessCalculator:
         segment = extracted.segment
         bandwidth = extracted.metrics["matched_bandwidth"]
         extra_metrics["fitness_metrics"] = dict(extracted.metrics)
+        if stage.s11_lower_bands:
+            extra_metrics["lower_s11_bands"] = self._lower_s11_summary(
+                stage, f_ghz, np.asarray(s11, dtype=float)
+            )["per_band"]
 
         cost, component_costs, raw_metrics = self._compute_cost(
             stage=stage,
@@ -758,10 +1112,11 @@ class FitnessCalculator:
             bandwidth=bandwidth,
             segment=segment,
             s21=np.asarray(s21, dtype=float),
-            gain_min=s21_max,
+            gain_min=gain_min,
             extra_metrics=extra_metrics,
         )
-        stage_met = self.is_target_met(stage, band_freqs, band_s11, bandwidth, s21_max)
+        stage_met = self.is_target_met(stage, f_ghz, np.asarray(s11, dtype=float), bandwidth,
+                                       gain_min, s12_max=s21_max)
 
         adaptive_scales = self._finalize_adaptive_scales(raw_metrics)
 
@@ -770,7 +1125,7 @@ class FitnessCalculator:
             bandwidth=bandwidth,
             s11_max=s11_max,
             s12_max=s21_max,
-            gain_min=s21_max,
+            gain_min=gain_min,
             target_met=stage_met and self.is_final_stage,
             stage_met=stage_met,
             stage_index=self.stage_index,
@@ -782,11 +1137,8 @@ class FitnessCalculator:
         )
 
     def _normalize_frequency(self, freqs: np.ndarray) -> np.ndarray:
-        """Normalize frequency values to GHz."""
-        mean_freq = np.mean(freqs)
-        if mean_freq > 1000:
-            return freqs / 1e9
-        return freqs
+        """Internal evaluation axes are explicitly GHz; never guess by magnitude."""
+        return np.asarray(freqs, dtype=float)
 
     def extract_metrics(
         self,
@@ -806,6 +1158,9 @@ class FitnessCalculator:
             + 2.0 * metrics["edge_violation_mean"]
             + 1.5 * metrics["edge_violation_max"]
             + 0.5 * np.sqrt(metrics["fullband_violation_sqmean"])
+            + 0.5 * metrics["gain_shortfall"]
+            + 4.0 * metrics.get("lower_s11_deficit_mean", 0.0)
+            + 2.5 * metrics.get("lower_s11_deficit_max", 0.0)
         )
 
     def fitness_for_de(self, metrics: Dict[str, float]) -> float:
@@ -820,6 +1175,8 @@ class FitnessCalculator:
             + 0.8 * coverage_gap
             + 0.5 * metrics["s12_violation_mean"]
             + 0.5 * metrics["gain_shortfall"]
+            + 6.0 * metrics.get("lower_s11_deficit_mean", 0.0)
+            + 4.0 * metrics.get("lower_s11_deficit_max", 0.0)
             - 0.2 * min(metrics["depth_mean"], 6.0)
         )
 
@@ -833,11 +1190,14 @@ class FitnessCalculator:
 
     def constraints_for_nsga2(self, metrics: Dict[str, float]) -> Dict[str, float]:
         """Package shared metrics into NSGA-II constraint details."""
-        return {
+        constraints = {
             "coverage_gap": float(metrics["coverage_left_gap"] + metrics["coverage_right_gap"]),
             "s12_violation": float(metrics["s12_violation_mean"]),
             "gain_shortfall": float(metrics["gain_shortfall"]),
         }
+        if self.active_stage.s11_lower_bands:
+            constraints["lower_s11_violation"] = float(metrics.get("lower_s11_violation", 9999.0))
+        return constraints
 
     def _extract_metrics_with_segment(
         self,
@@ -921,10 +1281,19 @@ class FitnessCalculator:
 
         gain_shortfall = 0.0
         if stage.gain_target is not None:
-            if band_s12 is None or not band_s12.size:
-                gain_shortfall = 1000.0
-            else:
-                gain_shortfall = max(float(stage.gain_target) - float(np.max(band_s12)), 0.0)
+            gain_min = self._band_peak_gain(extra_metrics)
+            gain_shortfall = 1000.0 if gain_min is None else max(float(stage.gain_target) - gain_min, 0.0)
+
+        lower_metrics: Dict[str, float] = {}
+        if stage.s11_lower_bands:
+            lower_summary = self._lower_s11_summary(stage, f_ghz, s11_values)
+            lower_metrics = {
+                "lower_s11_violation": float(lower_summary["violation_raw"]),
+                "lower_s11_deficit_mean": float(lower_summary["deficit_mean"]),
+                "lower_s11_deficit_max": float(lower_summary["deficit_max"]),
+                "lower_s11_missing_bands": float(lower_summary["missing_bands"]),
+                "lower_s11_point_count": float(lower_summary["point_count"]),
+            }
 
         return ExtractedMetrics(
             metrics={
@@ -940,6 +1309,7 @@ class FitnessCalculator:
                 "s12_violation_mean": float(np.mean(s12_excess)) if s12_excess.size else 0.0,
                 "gain_shortfall": float(gain_shortfall),
                 "geometry_metric": float(extra_metrics.get("geometry_metric", 0.0) or 0.0),
+                **lower_metrics,
             },
             segment=segment,
         )
@@ -1120,7 +1490,9 @@ class FitnessCalculator:
 
     def _single_objective_strategy(self) -> str:
         """Return the configured scalar wrapper strategy."""
-        strategy = self.fitness_config.get("single_objective_strategy", "legacy")
+        strategy = self.fitness_config.get("scalarization", self.fitness_config.get("single_objective_strategy", "legacy"))
+        if strategy == "weighted_metrics":
+            return "de"
         return str(strategy or "legacy").strip().lower()
 
     def _single_objective_wrapper_strategy(self) -> str:
@@ -1135,11 +1507,27 @@ class FitnessCalculator:
         return {name: 1.0 for name in self.TRACKED_COMPONENTS}
 
     def _finalize_adaptive_scales(self, raw_metrics: Dict[str, float]) -> Dict[str, float]:
-        """Apply post-evaluation scale updates consistently with scalar dispatch."""
+        """Evaluation is pure: one epoch always uses one set of penalty scales."""
         if self._single_objective_wrapper_strategy() == "legacy":
-            self._update_adaptive_scales(raw_metrics)
             return self.adaptive_scales.copy()
         return self._fixed_adaptive_scales()
+
+    def advance_penalty_epoch(self, results) -> bool:
+        """Update legacy adaptive penalties once after a complete evaluated batch.
+
+        Callers must rescore stored observations before comparing another epoch.
+        Cache hits and history import must never train or advance these scales.
+        """
+        if self._single_objective_wrapper_strategy() != "legacy" or not self.adaptive_config["enabled"]:
+            return False
+        metrics = [item.raw_metrics for item in results if item.valid and item.raw_metrics]
+        if not metrics:
+            return False
+        before = self.adaptive_scales.copy()
+        keys = {key for item in metrics for key in item}
+        aggregate = {key: float(np.mean([item.get(key, 0.0) for item in metrics])) for key in keys}
+        self._update_adaptive_scales(aggregate)
+        return self.adaptive_scales != before
 
     def _compute_component_cost(
         self,
@@ -1173,6 +1561,9 @@ class FitnessCalculator:
         excess = np.clip(band_s11 - thresholds, 0.0, None)
         violation_raw = float(np.mean(np.square(excess)) * 20.0 + np.mean(excess) * 2.0) if excess.size else 0.0
         s11_feasible = bool(np.all(excess <= 0.0))
+        lower_summary = self._lower_s11_summary(stage, f_ghz, s11)
+        lower_s11_violation_raw = float(lower_summary["violation_raw"])
+        all_s11_feasible = s11_feasible and bool(lower_summary["feasible"])
 
         bw_target = self._get_bandwidth_target_for_cost(stage)
         bandwidth_gap_raw = max(float(bw_target) - bw_value, 0.0) if bw_target is not None else 0.0
@@ -1209,6 +1600,11 @@ class FitnessCalculator:
 
         geometry_raw = float(extra_metrics.get("geometry_metric", 0.0) or 0.0)
         violation_cost = self.component_weights["violation"] * adaptive_scales["violation"] * violation_raw
+        lower_s11_cost = (
+            self.component_weights["violation"]
+            * adaptive_scales["violation"]
+            * lower_s11_violation_raw
+        )
         bandwidth_cost = self.component_weights["bandwidth"] * adaptive_scales["bandwidth"] * bandwidth_raw
         coverage_cost = self.component_weights["coverage"] * adaptive_scales["coverage"] * coverage_gap_raw
         s12_cost = self.component_weights["s12"] * adaptive_scales["s12"] * s12_violation_raw
@@ -1216,12 +1612,20 @@ class FitnessCalculator:
         geometry_cost = self.component_weights["geometry"] * (geometry_raw / self.geometry_reference)
         depth_bonus = self.component_weights["depth"] * depth_raw
 
-        positive_costs = violation_cost + bandwidth_cost + coverage_cost + s12_cost + gain_cost + geometry_cost
+        positive_costs = (
+            violation_cost
+            + lower_s11_cost
+            + bandwidth_cost
+            + coverage_cost
+            + s12_cost
+            + gain_cost
+            + geometry_cost
+        )
         constraint_penalty = positive_costs
 
         if self.objective_mode == "feasible_first":
-            cost = violation_cost
-            if not s11_feasible:
+            cost = violation_cost + lower_s11_cost
+            if not all_s11_feasible:
                 cost += 1000.0 + bandwidth_cost + coverage_cost
             else:
                 cost += bandwidth_cost + coverage_cost + geometry_cost
@@ -1233,6 +1637,7 @@ class FitnessCalculator:
         elif self.objective_mode == "minimax":
             normalized = [
                 violation_raw,
+                lower_s11_violation_raw,
                 bandwidth_gap_raw,
                 np.sqrt(coverage_gap_raw) if coverage_gap_raw > 0 else 0.0,
                 s12_violation_raw,
@@ -1262,6 +1667,16 @@ class FitnessCalculator:
             "geometry_raw": float(geometry_raw),
             "constraint_raw": float(constraint_penalty),
         }
+        if stage.s11_lower_bands:
+            component_costs["lower_s11_cost"] = float(lower_s11_cost)
+            raw_metrics.update(
+                {
+                    "lower_s11_violation_raw": float(lower_s11_violation_raw),
+                    "lower_s11_deficit_mean_raw": float(lower_summary["deficit_mean"]),
+                    "lower_s11_deficit_max_raw": float(lower_summary["deficit_max"]),
+                    "lower_s11_missing_bands_raw": float(lower_summary["missing_bands"]),
+                }
+            )
         return float(cost), component_costs, raw_metrics
 
     def _compute_cost(
@@ -1276,7 +1691,7 @@ class FitnessCalculator:
         extra_metrics: Optional[Dict[str, Any]] = None,
     ) -> Tuple[float, Dict[str, float], Dict[str, float]]:
         single_objective_strategy = self._single_objective_wrapper_strategy()
-        if self.objective_mode == "legacy" and not self.fitness_config:
+        if self.objective_mode == "legacy" and not self.fitness_config and not stage.s11_lower_bands:
             return self._legacy_cost(stage, freqs, s11, bandwidth, s21, gain_min)
         adaptive_scales_override = self._fixed_adaptive_scales() if single_objective_strategy in {"bo", "de"} else None
         cost, component_costs, raw_metrics = self._compute_component_cost(
@@ -1338,25 +1753,35 @@ class FitnessCalculator:
         s11: np.ndarray,
         bandwidth: Optional[float],
         gain_min: Optional[float],
+        *, s12_max: Optional[float] = None,
     ) -> bool:
         """Check whether the target is satisfied."""
-        thresholds = self._s11_threshold_array(stage, np.asarray(freqs, dtype=float))
-        band_s11 = np.asarray(s11, dtype=float)
+        if self._data_error(freqs, s11):
+            return False
+        f_ghz = self._normalize_frequency(np.asarray(freqs, dtype=float))
+        values = np.asarray(s11, dtype=float)
+        band_mask = (f_ghz >= stage.freq_band[0]) & (f_ghz <= stage.freq_band[1])
+        if not np.any(band_mask):
+            return False
+        thresholds = self._s11_threshold_array(stage, f_ghz[band_mask])
+        band_s11 = values[band_mask]
         if band_s11.size == 0 or thresholds.size == 0:
             return False
         if np.any(band_s11 > thresholds + 1e-12):
             return False
+        if not self._lower_s11_summary(stage, f_ghz, values)["feasible"]:
+            return False
 
         if stage.s12_target is not None:
-            if gain_min is None or gain_min > stage.s12_target:
+            if s12_max is None or not np.isfinite(s12_max) or s12_max > stage.s12_target:
                 return False
 
         if stage.bandwidth_target is not None:
-            if bandwidth is None or bandwidth < stage.bandwidth_target:
+            if bandwidth is None or not np.isfinite(bandwidth) or bandwidth < stage.bandwidth_target:
                 return False
 
         if stage.gain_target is not None:
-            if gain_min is None or gain_min < stage.gain_target:
+            if gain_min is None or not np.isfinite(gain_min) or gain_min < stage.gain_target:
                 return False
 
         return True

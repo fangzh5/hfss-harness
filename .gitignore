@@ -36,7 +36,21 @@ batch.log
 runs/
 temp/
 tmp/
-.agents/
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/hh-sim/
+!.agents/skills/hh-sim/**
+!.agents/skills/hh-iter/
+!.agents/skills/hh-iter/**
+!.agents/skills/hh-via/
+!.agents/skills/hh-via/**
+!.agents/skills/hh-export-pcb/
+!.agents/skills/hh-export-pcb/**
+!.agents/skills/hh-rebuild-pcb/
+!.agents/skills/hh-rebuild-pcb/**
+.codex/
+reports/
 .packages/
 .pytest_tmp_autovia/
 pytest-of-PC/
@@ -53,10 +67,16 @@ configs/**
 !configs/template_cmaes.json
 !configs/example_patch_opt.json
 
-# Docs: keep only the shared agent reference
+# Public documentation
 docs/**
 !docs/
 !docs/agent-reference.md
+!docs/migration-0.2.0.md
+!docs/via-planning.md
+!docs/via-creation.md
+!docs/pcb-stackup.md
+!docs/releases/
+!docs/releases/0.2.0.md
 !docs/assets/
 !docs/assets/example_patch_opt_dashboard_target_reached.png
 
@@ -91,10 +111,9 @@ data/
 
 # Public snapshot exclusions
 README.previous.md
-open_source_*.md
 docs/superpowers/
-scripts/
-optimizer/fabrication/
+scripts/*
+!scripts/create_vias_safely.py
 optimizer/legacy/
 optimizer/README.md
 optimizer/run_optimizer.py
@@ -105,18 +124,7 @@ optimizer/dashboard/style_options.*
 optimizer/dashboard/verification_*.png
 tests/test_create_me_dipole_bf33.py
 tests/test_create_vias_from_path_config.py
-tests/test_drill_stackup_write.py
 tests/test_export_hfss_fabrication_package.py
-tests/test_fabrication_model.py
-tests/test_gerber_write.py
 tests/test_kicad_source_export.py
-tests/test_layer_build.py
-tests/test_legacy_hfss_connector.py
-tests/test_package_check.py
 tests/test_rebuild_hfss_from_fabrication.py
-# Public skill allowlist: keep only hh-sim and hh-iter in the first public snapshot
-.codex/skills/*
-!.codex/skills/hh-sim/
-!.codex/skills/hh-sim/**
-!.codex/skills/hh-iter/
-!.codex/skills/hh-iter/**
+tests/test_legacy_hfss_connector.py

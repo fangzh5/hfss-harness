@@ -57,6 +57,22 @@ class DashboardCurveGridLayoutTests(unittest.TestCase):
         self.assertIn('label: "History Loaded"', self.js)
         self.assertIn('label: "BO MAE %"', self.js)
 
+    def test_multi_objective_dashboard_adapts_to_objective_count(self):
+        self.assertIn("getObjectiveDefinitions", self.js)
+        self.assertIn("getObjectiveLabel", self.js)
+        self.assertIn("getObjectiveCount", self.js)
+        self.assertIn("renderSingleObjectiveParetoChart", self.js)
+        self.assertIn("buildSingleObjectiveParetoSeries", self.js)
+        self.assertNotIn('<div class="kv-label">objective_1</div>', self.js)
+        self.assertNotIn('<div class="kv-label">objective_2</div>', self.js)
+        self.assertNotIn('meta: "representative objective_1"', self.js)
+        self.assertNotIn('meta: "representative objective_2"', self.js)
+
+    def test_single_objective_front_distinguishes_constraint_feasibility(self):
+        self.assertIn("violation <= 1e-12", self.js)
+        self.assertIn("bestFeasible", self.js)
+        self.assertIn("实心点满足硬约束，空心点违反约束", self.js)
+
 
 if __name__ == "__main__":
     unittest.main()

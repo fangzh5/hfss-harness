@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 from typing import Any
+import math
+try:
+    from .core.study import build_study_cases
+except ImportError:  # pragma: no cover
+    from core.study import build_study_cases
 
 
 class TaskConfigError(ValueError):
@@ -46,6 +51,8 @@ def _validate_sweep_variables(study: dict[str, Any]) -> None:
                 f"study.variables[{index - 1}] must provide numeric start/stop/step values."
             ) from exc
 
+        if not all(math.isfinite(value) for value in (start, stop, step)):
+            raise TaskConfigError(f"study.variables[{index - 1}] values must be finite.")
         if stop < start:
             raise TaskConfigError(f"study.variables[{index - 1}] stop must be greater than or equal to start.")
         if step <= 0:
@@ -58,26 +65,73 @@ def _reject_readonly_flags(config: dict[str, Any], task_type: str) -> None:
         return
 
     offending: list[str] = []
-    sections = (("top-level", config), ("optimization", config.get("optimization", {})))
+    sections = _mode_sections(config)
     for section_name, section in sections:
         if not isinstance(section, dict):
             continue
         for key in ("skip_simulation", "use_original_project"):
             if key in section:
                 offending.append(f"{section_name}.{key}")
+        if section.get("evaluation_mode", "solve") != "solve":
+            offending.append(f"{section_name}.evaluation_mode")
 
     if offending:
         joined = ", ".join(offending)
         raise TaskConfigError(f"{task_type} config must not include read-only flags: {joined}")
 
 
+def _mode_sections(config):
+    simulator = config.get("simulator", {})
+    hfss = simulator.get("hfss", {}) if isinstance(simulator, dict) else {}
+    return (("top-level", config), ("optimization", config.get("optimization", {})),
+            ("simulator", simulator), ("simulator.hfss", hfss))
+
+
+def resolve_evaluation_mode(config: dict[str, Any]) -> str:
+    """Resolve legacy flags without allowing contradictions or source writes."""
+    modes = []
+    flags = {"skip_simulation": [], "use_original_project": []}
+    for section_name, section in _mode_sections(config):
+        if not isinstance(section, dict):
+            continue
+        if "evaluation_mode" in section:
+            mode = section["evaluation_mode"]
+            if mode not in {"solve", "existing_results"}:
+                raise TaskConfigError(f"{section_name}.evaluation_mode must be solve or existing_results")
+            modes.append(mode)
+        for key in flags:
+            if key in section:
+                if type(section[key]) is not bool:
+                    raise TaskConfigError(f"{section_name}.{key} must be boolean")
+                flags[key].append(section[key])
+    if any(len(set(values)) > 1 for values in flags.values()) or len(set(modes)) > 1:
+        raise TaskConfigError("Conflicting evaluation mode flags")
+    skip = flags["skip_simulation"]
+    mode = modes[0] if modes else ("existing_results" if any(skip) else "solve")
+    if skip and skip[0] != (mode == "existing_results"):
+        raise TaskConfigError("skip_simulation conflicts with evaluation_mode")
+    if any(flags["use_original_project"]) and mode != "existing_results":
+        raise TaskConfigError("use_original_project requires existing_results; source writes are forbidden")
+    return mode
+
+
 def validate_task_config(config: dict[str, Any]) -> str:
     """Validate the config against the declared task type and return that type."""
     task_type = normalize_task_type(config)
+    opt_options = config.get("optimization", {})
+    if isinstance(opt_options, dict) and "keep_working_copy" in opt_options:
+        if type(opt_options["keep_working_copy"]) is not bool:
+            raise TaskConfigError("optimization.keep_working_copy must be a boolean")
 
     if task_type == "opt":
         _require_fields(config, ["parameters", "target", "algorithm"], task_type)
         _reject_readonly_flags(config, task_type)
+        opt = config.get("optimization", {})
+        if not isinstance(opt, dict):
+            raise TaskConfigError("optimization must be an object")
+        interval = opt.get("save_interval", 10)
+        if type(interval) is not int or interval < 0:
+            raise TaskConfigError("optimization.save_interval must be a nonnegative integer")
         return task_type
 
     if task_type == "sweep":
@@ -90,11 +144,17 @@ def validate_task_config(config: dict[str, Any]) -> str:
         study = config.get("study", {})
         if not isinstance(study, dict):
             raise TaskConfigError("sweep config requires study to be an object.")
-        _validate_sweep_variables(study)
+        if study.get("mode", "oat") != "explicit":
+            _validate_sweep_variables(study)
+        try:
+            build_study_cases(study)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise TaskConfigError(str(exc)) from exc
         _reject_readonly_flags(config, task_type)
         return task_type
 
     if task_type == "val":
+        resolve_evaluation_mode(config)
         _require_fields(config, ["cases", "target"], task_type)
         cases = config.get("cases")
         if not isinstance(cases, list) or not cases:

@@ -1,3 +1,4 @@
+import copy
 import math
 from typing import List
 
@@ -39,6 +40,7 @@ class NSGA2Optimizer(OptimizationAlgorithm):
         self.objectives = None
         self.constraint_violations = None
         self.source_sim_ids = np.full(self.pop_size, -1, dtype=int)
+        self.valid_individuals = np.zeros(self.pop_size, dtype=bool)
         self.ranks = np.full(self.pop_size, np.inf)
         self.crowding = np.zeros(self.pop_size, dtype=float)
 
@@ -48,6 +50,7 @@ class NSGA2Optimizer(OptimizationAlgorithm):
         self.last_representative_improved = False
         self.best_result = None
         self.best_source_sim_id = None
+        self._evaluated_records = []
 
     def _init_population(self, initial_population: np.ndarray | None = None) -> np.ndarray:
         if initial_population is not None:
@@ -95,6 +98,10 @@ class NSGA2Optimizer(OptimizationAlgorithm):
             objectives.append(np.asarray(getattr(result, "objectives", []), dtype=float))
             constraint_violations[idx] = float(getattr(result, "constraint_violation", 0.0))
             source_sim_ids[idx] = int(getattr(result, "source_sim_id", -1) or -1)
+            if not getattr(result, "valid", True):
+                # Internal only: every valid, finite violation dominates an invalid solve.
+                constraint_violations[idx] = np.inf
+                source_sim_ids[idx] = -1
             by_idx[idx] = result
 
         if len(by_idx) != self.pop_size:
@@ -244,34 +251,63 @@ class NSGA2Optimizer(OptimizationAlgorithm):
         self.crowding = crowding[selected_indices].copy()
 
         selected_records = [result_records[idx] for idx in selected_indices]
+        self.valid_individuals = np.asarray([getattr(record, "valid", True) for record in selected_records], dtype=bool)
         for local_idx, record in enumerate(selected_records):
             record.rank = int(self.ranks[local_idx])
             record.crowding_distance = float(self.crowding[local_idx])
 
+        self._evaluated_records = copy.deepcopy(selected_records)
+
         self._update_pareto_front(selected_records)
 
     def _update_pareto_front(self, selected_records: list) -> None:
-        front_indices = np.where(self.ranks == 0)[0]
+        front_indices = np.where((self.ranks == 0) & self.valid_individuals)[0]
         self.pareto_indices = front_indices
         self.pareto_front = []
         for idx in front_indices:
             record = selected_records[idx]
-            self.pareto_front.append(
-                {
-                    "params": np.asarray(record.params, dtype=float).tolist(),
-                    "objectives": np.asarray(record.objectives, dtype=float).tolist(),
-                    "constraint_violation": float(getattr(record, "constraint_violation", 0.0)),
-                    "rank": int(getattr(record, "rank", 0)),
-                    "crowding_distance": float(getattr(record, "crowding_distance", 0.0)),
-                    "source_sim_id": getattr(record, "source_sim_id", None),
-                }
-            )
+            self.pareto_front.append(self._front_record(record))
 
         self.last_front_updated = len(self.pareto_front) > 0
         self._update_representative_best(selected_records)
 
+    @staticmethod
+    def _front_record(record):
+        return {
+            "params": np.asarray(record.params, dtype=float).tolist(),
+            "objectives": np.asarray(record.objectives, dtype=float).tolist(),
+            "constraint_violation": float(getattr(record, "constraint_violation", 0.0)),
+            "rank": int(getattr(record, "rank", 0)),
+            "crowding_distance": float(getattr(record, "crowding_distance", 0.0)),
+            "source_sim_id": getattr(record, "source_sim_id", None),
+        }
+
+    def finalize_partial_batch(self, fitness_results: List) -> None:
+        """Publish valid observations when stopping, without pretending to tell a full generation.
+
+        Population and offspring remain unchanged. This is terminal result selection,
+        not a continuation API. Full records retain metric/target/provenance fields.
+        """
+        records = [copy.deepcopy(record) for record in self._evaluated_records + list(fitness_results)
+                   if getattr(record, "valid", True)]
+        if not records:
+            return
+        objectives = np.asarray([record.objectives for record in records], dtype=float)
+        violations = np.asarray([record.constraint_violation for record in records], dtype=float)
+        fronts = self._fast_non_dominated_sort(objectives, violations)
+        for rank, front in enumerate(fronts):
+            distances = self._crowding_distance(front, objectives)
+            for local_idx, index in enumerate(front):
+                records[index].rank = rank
+                records[index].crowding_distance = float(distances[local_idx])
+        previous_front = self.pareto_front
+        self.pareto_front = [self._front_record(records[index]) for index in fronts[0]]
+        self.last_front_updated = previous_front != self.pareto_front
+        self._update_representative_best(records)
+
     def _update_representative_best(self, selected_records: list) -> None:
-        if not selected_records:
+        valid_indices = [idx for idx, record in enumerate(selected_records) if getattr(record, "valid", True)]
+        if not valid_indices:
             self.last_representative_improved = False
             return
 
@@ -285,7 +321,7 @@ class NSGA2Optimizer(OptimizationAlgorithm):
                 -float(getattr(record, "crowding_distance", 0.0)),
             )
 
-        best_local_idx = min(range(len(selected_records)), key=key)
+        best_local_idx = min(valid_indices, key=key)
         best_record = selected_records[best_local_idx]
         representative_score = float(getattr(best_record, "constraint_violation", 0.0))
         if representative_score <= 1e-12:
@@ -410,6 +446,9 @@ class NSGA2Optimizer(OptimizationAlgorithm):
 
         parent_records = []
         for idx in range(self.pop_size):
+            if len(self._evaluated_records) == self.pop_size:
+                parent_records.append(copy.deepcopy(self._evaluated_records[idx]))
+                continue
             parent_record = type("ParentRecord", (), {})()
             parent_record.params = self.population[idx].copy()
             parent_record.objectives = self.objectives[idx].copy()
@@ -417,6 +456,7 @@ class NSGA2Optimizer(OptimizationAlgorithm):
             parent_record.rank = int(self.ranks[idx]) if np.isfinite(self.ranks[idx]) else 0
             parent_record.crowding_distance = float(self.crowding[idx])
             parent_record.source_sim_id = int(self.source_sim_ids[idx]) if idx < len(self.source_sim_ids) else None
+            parent_record.valid = bool(self.valid_individuals[idx])
             parent_records.append(parent_record)
 
         combined_population = np.vstack([self.population, offspring_params])

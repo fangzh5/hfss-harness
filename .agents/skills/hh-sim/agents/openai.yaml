@@ -1,0 +1,4 @@
+interface:
+  display_name: "HFSS Harness Sim"
+  short_description: "Prepare and verify HFSS opt, sweep and fixed-case runs"
+  default_prompt: "Use $hh-sim to prepare or run an AEDT simulation task, reuse my supplied inputs and authorization, and verify the results."

@@ -256,6 +256,11 @@ class BOOptimizer(OptimizationAlgorithm):
             raise ValueError("History params must have shape (n, n_dims).")
         if params_array.shape[0] != costs_array.shape[0]:
             raise ValueError("History params/cost lengths do not match.")
+        if not np.all(np.isfinite(params_array)) or not np.all(np.isfinite(costs_array)):
+            raise ValueError("History parameters and costs must be finite.")
+        if any(np.any(params_array[:, i] < low) or np.any(params_array[:, i] > high)
+               for i, (low, high) in enumerate(self.bounds)):
+            raise ValueError("History parameters must be inside bounds, never clipped.")
         if params_array.shape[0] == 0:
             return 0
 
@@ -368,7 +373,7 @@ class BOOptimizer(OptimizationAlgorithm):
 
     def update(self, fitness_results: List):
         for result in fitness_results:
-            if not hasattr(result, "params") or not hasattr(result, "cost"):
+            if not getattr(result, "valid", True) or not hasattr(result, "params") or not hasattr(result, "cost") or not np.isfinite(result.cost):
                 continue
 
             params = self._clip(np.asarray(result.params, dtype=float))

@@ -5,8 +5,13 @@
     "work_dir": "../temp",
     "project_suffix": "_work",
     "save_best_on_exit": true,
-    "save_interval": 1,
-    "initial_point": [1.04, 1.37, 0.25]
+    "save_interval": 10,
+    "initial_point": [
+      1.12,
+      1.51
+    ],
+    "seed_initial_point": true,
+    "stop_on_target": true
   },
   "launch": {
     "dashboard": true,
@@ -17,30 +22,25 @@
   "parameters": [
     {
       "name": "patch_x",
-      "min": 0.99,
-      "max": 1.10,
+      "min": 0.9,
+      "max": 1.5,
       "unit": "mm",
       "resolution": 0.01
     },
     {
       "name": "patch_y",
-      "min": 1.32,
-      "max": 1.42,
+      "min": 1.3,
+      "max": 1.65,
       "unit": "mm",
       "resolution": 0.01
-    },
-    {
-      "name": "probe_p",
-      "min": 0.25,
-      "max": 0.50,
-      "unit": "mm",
-      "resolution": 0.01,
-      "constraint": "probe_p <= patch_x / 2"
     }
   ],
   "target": {
-    "freq_band": [59, 61],
-    "s11_threshold": -15,
+    "freq_band": [
+      59,
+      61
+    ],
+    "s11_threshold": -10,
     "bandwidth_target": null,
     "gain_min": null
   },
@@ -48,8 +48,12 @@
     "method": "cmaes",
     "mode": "local",
     "max_iterations": 50,
-    "early_stop_patience": 10,
-    "max_simulations": 50
+    "early_stop_patience": 0,
+    "max_simulations": 200,
+    "advanced": {
+      "seed": 42,
+      "sigma0": 0.25
+    }
   },
   "simulator": {
     "hfss": {
@@ -59,12 +63,19 @@
       "sweep_name": "Sweep",
       "new_desktop": true,
       "non_graphical": true,
-      "close_projects": 0,
-      "close_desktop": 0,
+      "close_projects": true,
+      "close_desktop": true,
       "results": {
         "s11": "dB(S(1,1))",
         "freq_unit": "GHz"
-      }
+      },
+      "aedt_version": "2023.2",
+      "use_grpc_api": false,
+      "expected_freq_band": [
+        55,
+        65
+      ],
+      "min_band_points": 41
     }
   },
   "output": {

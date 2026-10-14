@@ -7,6 +7,7 @@ import numpy as np
 from typing import List, Optional
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel
+from scipy.special import ndtr
 from .base import OptimizationAlgorithm
 
 
@@ -117,7 +118,7 @@ class SurrogateOptimizer(OptimizationAlgorithm):
 
     def _norm_cdf(self, x: np.ndarray) -> np.ndarray:
         """标准正态分布CDF"""
-        return 0.5 * (1.0 + np.erf(x / np.sqrt(2)))
+        return ndtr(x)
 
     def _norm_pdf(self, x: np.ndarray) -> np.ndarray:
         """标准正态分布PDF"""
@@ -148,7 +149,7 @@ class SurrogateOptimizer(OptimizationAlgorithm):
         y_new = []
 
         for result in fitness_results:
-            if hasattr(result, 'params') and hasattr(result, 'cost'):
+            if getattr(result, 'valid', True) and hasattr(result, 'params') and hasattr(result, 'cost') and np.isfinite(result.cost):
                 X_new.append(result.params)
                 y_new.append(result.cost)
 

@@ -36,6 +36,8 @@ class OptimizationAlgorithm(ABC):
 
     def update_best(self, params: np.ndarray, cost: float):
         """更新最优解"""
+        if not np.isfinite(cost) or not np.all(np.isfinite(params)):
+            raise ValueError("Algorithm best point and score must be finite")
         if cost < self.best_cost:
             self.best_cost = cost
             self.best_params = params.copy()

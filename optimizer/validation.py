@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,8 @@ try:
     from .path_utils import resolve_run_stamp, resolve_task_output_dir
     from .result_records import build_simulation_record
     from .task_config import validate_task_config
+    from .case_executor import CaseExecutor, CaseJournal, finish_journal
+    from .run_deadline import parse_deadline
 except ImportError:  # pragma: no cover
     from core import FitnessCalculator
     from dashboard.state_bridge import TaskDashboardStateWriter
@@ -36,6 +39,8 @@ except ImportError:  # pragma: no cover
     from path_utils import resolve_run_stamp, resolve_task_output_dir
     from result_records import build_simulation_record
     from task_config import validate_task_config
+    from case_executor import CaseExecutor, CaseJournal, finish_journal
+    from run_deadline import parse_deadline
 
 
 def _resolve_task_output_dir(config: dict[str, Any]) -> Path:
@@ -241,6 +246,10 @@ def run_val_cases(config: dict[str, Any], adapter) -> dict[str, Any]:
     case_count = len(cases)
     far_field_meta_written = False
     dashboard_writer = None
+    failed_cases = []
+    attempted_cases = 0
+    stop_reason = None
+    deadline = parse_deadline(config.get("optimization", {}).get("end_at"))
 
     fitness_calc = FitnessCalculator(
         freq_band=tuple(target.get("freq_band", [0, 0])),
@@ -253,7 +262,10 @@ def run_val_cases(config: dict[str, Any], adapter) -> dict[str, Any]:
         fitness_config=target.get("fitness"),
         multi_objective_config=target.get("multi_objective"),
         s11_profile=target.get("s11_profile"),
+        s11_lower_bands=target.get("s11_lower_bands"),
     )
+    journal = CaseJournal(task_output_dir / "cases.jsonl")
+    executor = CaseExecutor(adapter, fitness_calc, config, baseline, journal)
     try:
         dashboard_writer = TaskDashboardStateWriter(task_output_dir, config, max_simulations=case_count)
     except Exception as exc:
@@ -261,14 +273,16 @@ def run_val_cases(config: dict[str, Any], adapter) -> dict[str, Any]:
 
     try:
         for index, case in enumerate(cases, start=1):
+            if deadline is not None and time.time() >= deadline:
+                stop_reason = "deadline"
+                break
+            if dashboard_writer is not None and dashboard_writer.is_stop_requested():
+                stop_reason = "user_stop"
+                break
             case_name = _case_name(case, index)
             params = _case_params(case)
-
-            _restore_baseline(adapter, baseline)
-            for name, value in params.items():
-                _set_named_parameter(adapter, str(name), float(value))
-
-            next_sim_id = total_cases + 1
+            attempted_cases += 1
+            next_sim_id = index
             if dashboard_writer is not None:
                 try:
                     dashboard_writer.begin_simulation(
@@ -288,21 +302,19 @@ def run_val_cases(config: dict[str, Any], adapter) -> dict[str, Any]:
                 f"case={case_name} case_index={index}",
                 flush=True,
             )
-            freqs, s11, s12 = adapter.simulate()
-            if freqs is None or s11 is None:
+            outcome = executor.execute(index, params, fields={"task_type": "val", "case_name": case_name,
+                                       "case_index": index, "case_count": case_count})
+            if outcome.status != "completed":
+                failed_cases.append({"case_name": case_name, "case_index": index,
+                                     "failure_reason": outcome.failure_reason})
                 print(
                     f"[progress] task=val phase=failed sim_id={next_sim_id} total={case_count} "
                     f"case={case_name} case_index={index}",
                     flush=True,
                 )
                 continue
-
-            extra_metrics = {}
-            try:
-                extra_metrics = collect_optional_metrics(config, adapter)
-            except Exception as exc:
-                print(f"Optional far-field metric collection failed for {case_name}: {exc}")
-                extra_metrics = {}
+            freqs, s11, s12 = outcome.freqs, outcome.s11, outcome.s12
+            extra_metrics = outcome.extra_metrics
 
             far_field_summary = _summarize_far_field(extra_metrics)
             if not far_field_meta_written:
@@ -312,15 +324,10 @@ def run_val_cases(config: dict[str, Any], adapter) -> dict[str, Any]:
                     if isinstance(meta, dict):
                         far_field_meta_written = True
 
-            fitness = fitness_calc.calculate(freqs, s11, s12, extra_metrics=extra_metrics)
+            fitness = outcome.fitness
             total_cases += 1
 
-            current_params = {}
-            if hasattr(adapter, "capture_current_parameter_state"):
-                try:
-                    current_params = adapter.capture_current_parameter_state()
-                except Exception:
-                    current_params = {}
+            current_params = outcome.params
 
             raw_rows.append(
                 build_simulation_record(
@@ -344,7 +351,7 @@ def run_val_cases(config: dict[str, Any], adapter) -> dict[str, Any]:
                 "case_name": case_name,
                 "case_index": index,
                 "case_count": len(cases),
-                "sim_id": total_cases,
+                "sim_id": next_sim_id,
                 "cost": float(fitness.cost),
                 "s11_max": fitness.s11_max,
                 "bandwidth": fitness.bandwidth,
@@ -387,29 +394,49 @@ def run_val_cases(config: dict[str, Any], adapter) -> dict[str, Any]:
                 f"case={case_name} case_index={index} cost={float(fitness.cost):.4f}",
                 flush=True,
             )
-    finally:
-        _restore_baseline(adapter, baseline)
-
-    if raw_format == "csv":
-        _write_csv(raw_path, raw_rows)
-    else:
-        _write_jsonl(raw_path, raw_rows)
-    _write_csv(summary_path, summary_rows)
-    report_md = _build_report_md(config, summary_rows, report_path)
-    report_path.write_text(report_md, encoding="utf-8")
-    _plot_overview(overview_path, summary_rows)
-    if dashboard_writer is not None:
+    except BaseException as exc:
         try:
-            dashboard_writer.finalize("Completed", f"Validation finished with {total_cases} cases")
-        except Exception as exc:
-            print(f"Dashboard snapshot finalize failed: {exc}")
+            finish_journal(journal, status="Stopped" if isinstance(exc, KeyboardInterrupt) else "Failed",
+                           reason=str(exc) or type(exc).__name__, writer=dashboard_writer)
+        finally:
+            journal.close()
+        raise
 
-    return {
-        "task_output_dir": str(task_output_dir),
-        "data_path": str(raw_path),
-        "summary_path": str(summary_path),
-        "report_path": str(report_path),
-        "overview_path": str(overview_path),
-        "total_cases": total_cases,
-        "cases": case_details,
-    }
+    try:
+        if raw_format == "csv":
+            _write_csv(raw_path, raw_rows)
+        else:
+            _write_jsonl(raw_path, raw_rows)
+        _write_csv(summary_path, summary_rows)
+        report_md = _build_report_md(config, summary_rows, report_path)
+        report_path.write_text(report_md, encoding="utf-8")
+        _plot_overview(overview_path, summary_rows)
+        if dashboard_writer is not None:
+            try:
+                status = "Stopped" if stop_reason else ("Failed" if failed_cases else "Completed")
+                dashboard_writer.finalize(status, f"Validation: {total_cases} completed, {len(failed_cases)} failed; {stop_reason or 'finished'}")
+            except Exception as exc:
+                print(f"Dashboard snapshot finalize failed: {exc}")
+
+        finish_journal(journal, status="Stopped" if stop_reason else ("Failed" if failed_cases else "Completed"),
+                       reason=stop_reason or "Task outputs saved")
+        return {
+            "task_output_dir": str(task_output_dir),
+            "data_path": str(raw_path),
+            "summary_path": str(summary_path),
+            "report_path": str(report_path),
+            "overview_path": str(overview_path),
+            "total_cases": total_cases,
+            "attempted_cases": attempted_cases,
+            "failed_cases": failed_cases,
+            "status": "Stopped" if stop_reason else ("Failed" if failed_cases else "Completed"),
+            "stop_reason": stop_reason,
+            "journal_path": str(journal.path),
+            "cases": case_details,
+        }
+
+    except BaseException as exc:
+        finish_journal(journal, status="Failed", reason=str(exc) or type(exc).__name__, writer=dashboard_writer)
+        raise
+    finally:
+        journal.close()

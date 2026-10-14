@@ -132,8 +132,9 @@ class CMAESOptimizer(OptimizationAlgorithm):
 
         self._strategy.tell(self._asked_batch.copy(), costs)
         self._asked_batch = None
-        for physical, cost in zip(physical_points, costs):
-            self.update_best(physical, cost)
+        for physical, cost, result in zip(physical_points, costs, results):
+            if getattr(result, "valid", True):
+                self.update_best(physical, cost)
 
     def get_best(self) -> np.ndarray:
         if self.best_params is not None:

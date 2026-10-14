@@ -1,4 +1,4 @@
-﻿"""
+"""
 HFSS仿真器适配器
 通过PyAEDT连接HFSS进行仿真
 支持文件复制保护、最优结果保存等功能
@@ -13,15 +13,20 @@ import math
 import re
 import shutil
 import time
+import uuid
 import numpy as np
 from pathlib import Path
 from typing import Tuple, Optional, Iterable, Any
 try:
     from .base import SimulatorAdapter
-    from ..task_config import normalize_task_type
+    from ..task_config import normalize_task_type, resolve_evaluation_mode
+    from ..results import TraceData, ResultBundle, frequency_to_ghz
+    from ..provenance import file_sha256
 except ImportError:  # pragma: no cover
     from adapters.base import SimulatorAdapter
-    from task_config import normalize_task_type
+    from task_config import normalize_task_type, resolve_evaluation_mode
+    from results import TraceData, ResultBundle, frequency_to_ghz
+    from provenance import file_sha256
 
 
 class HFSSAdapter(SimulatorAdapter):
@@ -41,6 +46,12 @@ class HFSSAdapter(SimulatorAdapter):
         super().__init__(config)
         self.optimization_config = optimization_config or {}
         self.task_type = normalize_task_type(self.optimization_config)
+        self.evaluation_mode = resolve_evaluation_mode({
+            "optimization": self.optimization_config, "simulator": {"hfss": config}})
+        if self.task_type in {"opt", "sweep"} and self.evaluation_mode != "solve":
+            raise ValueError("Optimization and sweep tasks must solve a protected work copy")
+        self.config = dict(config)
+        self.config["skip_simulation"] = self.evaluation_mode == "existing_results"
         self.task_name = task_name or "task"
         self.app = None
         self.work_project_path = None
@@ -58,6 +69,14 @@ class HFSSAdapter(SimulatorAdapter):
         self.current_params = None
         self._parameter_units: dict[str, str] = {}
         self._parameter_baseline: dict[str, Any] = {}
+        self._parameter_state_valid = True
+        self._failed_parameter_snapshot = {}
+        self.last_parameter_error = None
+        self.last_result_bundle = None
+        self._last_trace_source = {}
+        self._result_context = {}
+        self.source_project_sha256 = None
+        self.execution_fingerprint = None
 
     def _get_results_dir(self) -> str:
         """获取结果保存目录（原始项目目录下的results文件夹）"""
@@ -163,14 +182,19 @@ class HFSSAdapter(SimulatorAdapter):
         try:
             start, stop = float(expected_band[0]), float(expected_band[1])
         except Exception:
-            return True
+            return False
 
         values = np.asarray(freqs, dtype=float)
-        if values.size == 0:
+        if values.ndim != 1 or values.size == 0 or not np.all(np.isfinite(values)):
             return False
 
         in_band = values[(values >= start - 1e-9) & (values <= stop + 1e-9)]
         min_points = int(self.config.get('min_band_points', 2))
+        if start == stop:
+            min_points = 1
+        if values[0] > start + 1e-8 or values[-1] < stop - 1e-8:
+            print(f"Rejected solution data ({label}): missing frequency band boundaries")
+            return False
         if in_band.size < min_points:
             print(
                 f"Rejected solution data ({label}): "
@@ -198,7 +222,7 @@ class HFSSAdapter(SimulatorAdapter):
         if isinstance(value, (int, float, np.integer, np.floating)):
             return float(value), ""
         text = HFSSAdapter._to_plain_string(value).strip()
-        match = re.match(r"^\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*([A-Za-z_][A-Za-z0-9_/-]*)?\s*$", text)
+        match = re.match(r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([A-Za-z_][A-Za-z0-9_/-]*)?\s*$", text)
         if not match:
             return None, ""
         numeric = float(match.group(1))
@@ -213,6 +237,11 @@ class HFSSAdapter(SimulatorAdapter):
         resolution: float | None = None,
     ) -> str:
         if isinstance(value, str):
+            if not value.strip():
+                raise ValueError(f"{name}: assignment must not be empty")
+            numeric_value, _ = self._split_numeric_unit(value)
+            if numeric_value is not None and not math.isfinite(numeric_value):
+                raise ValueError(f"{name}: value must be finite")
             return value
 
         raw_unit = unit or self._parameter_units.get(name, "")
@@ -220,6 +249,8 @@ class HFSSAdapter(SimulatorAdapter):
             _, raw_unit = self._split_numeric_unit(self._parameter_baseline[name])
 
         numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ValueError(f"{name}: value must be finite")
         if resolution:
             try:
                 resolution_value = float(resolution)
@@ -227,8 +258,96 @@ class HFSSAdapter(SimulatorAdapter):
                 resolution_value = 0.0
             if resolution_value > 0.0:
                 numeric = round(numeric / resolution_value) * resolution_value
-        numeric = round(numeric, 4)
-        return f"{numeric}{raw_unit}" if raw_unit else f"{numeric}"
+        return f"{numeric:.17g}{raw_unit}"
+
+    def _read_parameter_expression(self, name: str) -> str:
+        manager = getattr(self.app, "variable_manager", None)
+        if manager is not None:
+            if name not in manager.variable_names:
+                raise ValueError(f"Unknown AEDT parameter {name!r}")
+            value = manager.get_expression(name)
+        else:
+            value = self.app[name]
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"Could not read AEDT parameter {name!r}")
+        return value
+
+    def _assignment_matches(self, name: str, expected: str) -> bool:
+        actual = self._read_parameter_expression(name)
+        number, unit = self._split_numeric_unit(expected)
+        actual_number, actual_unit = self._split_numeric_unit(actual)
+        if number is not None:
+            if actual_number is None or unit != actual_unit:
+                if not hasattr(self.app, "get_evaluated_value"):
+                    return False
+                if actual_number is not None and unit != actual_unit:
+                    from ansys.aedt.core.generic.constants import unit_system
+                    expected_system, actual_system = unit_system(unit), unit_system(actual_unit)
+                    if not expected_system or expected_system != actual_system:
+                        return False
+                actual_number = self.app.get_evaluated_value(name, units=unit or None)
+            if type(actual_number) is bool:
+                return False
+            return math.isfinite(float(actual_number)) and math.isclose(
+                float(actual_number), number, rel_tol=1e-10, abs_tol=1e-15)
+        if "".join(actual.split()) != "".join(expected.split()):
+            return False
+        if hasattr(self.app, "get_evaluated_value"):
+            evaluated = self.app.get_evaluated_value(name)
+            return type(evaluated) is not bool and math.isfinite(float(evaluated))
+        return True
+
+    def apply_parameter_values(self, values: dict[str, Any], *, units=None, resolutions=None) -> bool:
+        """Apply existing variables atomically and verify fresh AEDT readback."""
+        if not self.app:
+            return False
+        units, resolutions = units or {}, resolutions or {}
+        snapshot = {}
+        write_attempted = False
+        try:
+            # Read everything before any write, including units for named val/sweep updates.
+            snapshot = {name: self._read_parameter_expression(name) for name in values}
+            for name, expression in snapshot.items():
+                _, inferred_unit = self._split_numeric_unit(expression)
+                if inferred_unit:
+                    self._parameter_units[name] = inferred_unit
+            assignments = {name: self._format_parameter_assignment(
+                name, value, unit=units.get(name), resolution=resolutions.get(name))
+                for name, value in values.items()}
+            if self.evaluation_mode == "existing_results":
+                if not all(self._assignment_matches(name, value) for name, value in assignments.items()):
+                    raise ValueError("Existing results cannot be evaluated with changed model parameters")
+                return True
+            for name, assignment in assignments.items():
+                write_attempted = True
+                self.app[name] = assignment
+            for name, assignment in assignments.items():
+                if not self._assignment_matches(name, assignment):
+                    raise RuntimeError(f"AEDT readback mismatch for {name!r}")
+            self.last_parameter_error = None
+            return True
+        except Exception as exc:
+            rollback_errors = []
+            if write_attempted:
+                for name, expression in snapshot.items():
+                    try:
+                        self.app[name] = expression
+                    except Exception as rollback_exc:
+                        rollback_errors.append(f"{name}: {rollback_exc}")
+                for name, expression in snapshot.items():
+                    try:
+                        if not self._assignment_matches(name, expression):
+                            raise RuntimeError("rollback readback mismatch")
+                    except Exception as rollback_exc:
+                        rollback_errors.append(f"{name}: {rollback_exc}")
+            if rollback_errors:
+                self._parameter_state_valid = False
+                self._failed_parameter_snapshot = snapshot.copy()
+            self.last_parameter_error = str(exc)
+            if rollback_errors:
+                self.last_parameter_error += "; rollback failed: " + "; ".join(rollback_errors)
+            print(f"Parameter transaction failed: {self.last_parameter_error}")
+            return False
 
     def capture_current_parameter_state(self, param_names: Iterable[str] | None = None) -> dict[str, Any]:
         """Capture the current design variable state from AEDT."""
@@ -246,11 +365,11 @@ class HFSSAdapter(SimulatorAdapter):
                 if unit:
                     self._parameter_units[str(name)] = unit
 
-        if param_names is not None:
-            for name in param_names:
-                key = str(name)
-                if key not in baseline and hasattr(self.app, key):
-                    baseline[key] = self._to_plain_string(getattr(self.app, key))
+        manager = getattr(self.app, "variable_manager", None)
+        names = list(param_names) if param_names is not None else (
+            list(manager.variable_names) if manager is not None else list(baseline))
+        for name in names:
+            baseline[str(name)] = self._read_parameter_expression(str(name))
 
         self._parameter_baseline = baseline.copy()
         return baseline
@@ -260,14 +379,13 @@ class HFSSAdapter(SimulatorAdapter):
         if not self.app:
             return False
 
-        try:
-            for name, value in state.items():
-                self.app[name] = self._to_plain_string(value)
+        if self.apply_parameter_values(state):
+            if set(self._failed_parameter_snapshot).issubset(state):
+                self._parameter_state_valid = True
+                self._failed_parameter_snapshot = {}
             self._parameter_baseline = dict(state)
             return True
-        except Exception as exc:
-            print(f"Failed to restore parameter state: {exc}")
-            return False
+        return False
 
     def _iter_candidate_setup_sweeps(self) -> list[str]:
         """Return setup/sweep names in priority order.
@@ -281,7 +399,9 @@ class HFSSAdapter(SimulatorAdapter):
         setup_name = self.config.get('setup_name')
         sweep_name = self.config.get('sweep_name')
         if setup_name and sweep_name:
-            candidates.append(f"{setup_name} : {sweep_name}")
+            return [f"{setup_name} : {sweep_name}"]
+        if setup_name:
+            return [f"{setup_name} : LastAdaptive"]
 
         if self.app:
             nominal_sweep = getattr(self.app, 'nominal_sweep', None)
@@ -336,15 +456,21 @@ class HFSSAdapter(SimulatorAdapter):
         skip_simulation = self.config.get('skip_simulation', False)
         if skip_simulation or self.use_original_project:
             self.work_project_path = self.original_project_path
+            try:
+                self.source_project_sha256 = file_sha256(self.original_project_path)
+            except OSError as exc:
+                print(f"Cannot fingerprint existing-results source: {exc}")
+                return False
             mode_label = "Read-only mode" if skip_simulation else "Direct-project mode"
             print(f"{mode_label}: use the original file")
-        elif self.optimization_config:
-            self._clean_lock_files(self.original_project_path)
-            self.work_project_path = self._copy_project_to_work_dir()
-            self._clean_lock_files(self.work_project_path)
         else:
-            self._clean_lock_files(self.original_project_path)
-            self.work_project_path = self._copy_project_to_work_dir()
+            try:
+                self.work_project_path = self._copy_project_to_work_dir()
+            except (OSError, ValueError) as exc:
+                print(f"Failed to prepare protected work copy: {exc}")
+                self.work_project_path = None
+                self._is_connected = False
+                return False
             self._clean_lock_files(self.work_project_path)
 
         if not os.path.exists(self.work_project_path):
@@ -355,9 +481,17 @@ class HFSSAdapter(SimulatorAdapter):
         try:
             from ansys.aedt.core import Hfss
 
+            use_grpc_api = self.config.get('use_grpc_api')
+            if use_grpc_api is not None:
+                from ansys.aedt.core import settings
+                settings.use_grpc_api = bool(use_grpc_api)
+
             print(f"Connecting to HFSS...")
             print(f"  Project: {self.work_project_path}")
             print(f"  Mode: non_graphical={self.config.get('non_graphical', True)}")
+            if use_grpc_api is not None:
+                api_mode = "gRPC" if bool(use_grpc_api) else "COM"
+                print(f"  PyAEDT API: {api_mode}")
             self.app = Hfss(
                 project=self.work_project_path,
                 design=self.config.get('design_name', ''),
@@ -367,6 +501,12 @@ class HFSSAdapter(SimulatorAdapter):
                 remove_lock=self.config.get('remove_lock', False),
                 close_on_exit=False
             )
+            if getattr(self.app, "valid_design", True) is not True:
+                raise RuntimeError(
+                    "PyAEDT returned an invalid HFSS design handle "
+                    f"for project={self.work_project_path!r}, "
+                    f"design={self.config.get('design_name', '')!r}"
+                )
             self._is_connected = True
             print(f"Connected to HFSS project")
             return True
@@ -379,11 +519,10 @@ class HFSSAdapter(SimulatorAdapter):
     def _copy_project_to_work_dir(self) -> str:
         """复制原始AEDT文件到工作目录"""
         if not self.original_project_path:
-            return self.original_project_path
+            raise ValueError("An AEDT source project is required")
 
         if not os.path.exists(self.original_project_path):
-            print(f"Warning: original file not found: {self.original_project_path}")
-            return self.original_project_path
+            raise FileNotFoundError(f"AEDT source project not found: {self.original_project_path}")
 
         work_dir = self._get_temp_dir()
 
@@ -397,19 +536,27 @@ class HFSSAdapter(SimulatorAdapter):
         new_name = f"{original_name}{suffix}_{self.task_name}{original_ext}"
         work_path = os.path.join(work_dir, new_name)
 
+        if Path(work_path).resolve() == Path(self.original_project_path).resolve() or (
+            os.path.exists(work_path) and os.path.samefile(work_path, self.original_project_path)
+        ):
+            raise ValueError("AEDT work copy must be separate from the source project")
+
         if os.path.exists(work_path):
-            print(f"Work copy already exists, using: {work_path}")
-            return work_path
+            raise FileExistsError(
+                f"Work copy already exists; use a fresh task directory: {work_path}")
 
         try:
+            source_hash = file_sha256(self.original_project_path)
             if os.path.isdir(self.original_project_path):
                 shutil.copytree(self.original_project_path, work_path)
             else:
                 shutil.copy2(self.original_project_path, work_path)
+            if file_sha256(work_path) != source_hash or file_sha256(self.original_project_path) != source_hash:
+                raise OSError("AEDT source changed during copying or the copy is incomplete")
+            self.source_project_sha256 = source_hash
             print(f"Copied original file to: {work_path}")
-        except Exception as e:
-            print(f"Failed to copy file: {e}")
-            return self.original_project_path
+        except OSError as e:
+            raise OSError(f"Cannot create AEDT work copy at {work_path}: {e}") from e
 
         return work_path
 
@@ -505,14 +652,17 @@ class HFSSAdapter(SimulatorAdapter):
         close_projects = bool(self.config.get('close_projects', 0))
         close_desktop = bool(self.config.get('close_desktop', 0))
         sweep_task = self._is_sweep_task()
+        closure_confirmed = False
 
         if self.app:
-            try:
-                self.app.modeler.fit_all()
-            except Exception:
-                pass
+            optimization_finished = getattr(self, "_optimization_finished", False)
+            if not optimization_finished:
+                try:
+                    self.app.modeler.fit_all()
+                except Exception:
+                    pass
 
-            if not skip_simulation and not sweep_task:
+            if not skip_simulation and not sweep_task and not optimization_finished:
                 try:
                     self.app.save_project()
                     print("Project saved")
@@ -522,17 +672,21 @@ class HFSSAdapter(SimulatorAdapter):
             time.sleep(0.5)
 
             try:
-                if sweep_task:
-                    self.app.release_desktop(close_projects=False)
-                    print("Desktop released (sweep working copy)")
-                elif close_desktop:
+                if close_desktop:
                     if hasattr(self.app, 'close_desktop'):
-                        self.app.close_desktop()
+                        released = self.app.close_desktop()
                     else:
-                        self.app.release_desktop(close_projects=close_projects)
+                        released = self.app.release_desktop(close_projects=True, close_desktop=True)
+                    closure_confirmed = released is True
+                    if released is False:
+                        raise RuntimeError("AEDT did not confirm desktop closure")
                     print("Desktop closed")
                 else:
-                    self.app.release_desktop(close_projects=close_projects)
+                    # Design.release_desktop defaults close_desktop=True in PyAEDT 0.18.1.
+                    released = self.app.release_desktop(close_projects=close_projects, close_desktop=False)
+                    closure_confirmed = released is True and close_projects
+                    if released is False:
+                        raise RuntimeError("AEDT did not confirm desktop release")
                     print("Desktop released")
             except Exception as e:
                 print(f"Failed to release Desktop: {e}")
@@ -546,8 +700,7 @@ class HFSSAdapter(SimulatorAdapter):
             finally:
                 self.app = None
 
-            if skip_simulation or close_projects or close_desktop:
-                self._clean_lock_files(self.original_project_path)
+            if closure_confirmed:
                 if self.work_project_path and self.work_project_path != self.original_project_path:
                     self._clean_lock_files(self.work_project_path)
 
@@ -557,7 +710,12 @@ class HFSSAdapter(SimulatorAdapter):
         except Exception:
             pass
         time.sleep(1.0)
-        self._cleanup_temp_copy()
+        if closure_confirmed and not self.optimization_config.get("keep_working_copy", False):
+            self._cleanup_temp_copy()
+        elif closure_confirmed and self.work_project_path:
+            print(f"Working copy retained by keep_working_copy: {self.work_project_path}")
+        elif self.work_project_path:
+            print(f"Working copy retained; project closure was not confirmed: {self.work_project_path}")
 
         self._is_connected = False
         print("Disconnected from HFSS")
@@ -573,15 +731,8 @@ class HFSSAdapter(SimulatorAdapter):
         if not self.app:
             return False
 
-        try:
-            assignment = self._format_parameter_assignment(name, value, unit=unit, resolution=resolution)
-            self.app[name] = assignment
-            if unit:
-                self._parameter_units[name] = unit
-            return True
-        except Exception as e:
-            print(f"Failed to set parameter {name}: {e}")
-            return False
+        return self.apply_parameter_values({name: value}, units={name: unit},
+                                           resolutions={name: resolution})
 
     def _apply_fixed_parameters(self) -> bool:
         """Apply non-optimized design variables fixed by the task config."""
@@ -606,19 +757,26 @@ class HFSSAdapter(SimulatorAdapter):
         if not self.app:
             return False
 
-        self.current_params = params.copy()
         param_names = self.config.get('param_names', [])
         param_units = self.config.get('param_units', ['mm'] * len(param_names))
         param_resolutions = self.config.get('param_resolutions', [None] * len(param_names))
 
         try:
-            if not self._apply_fixed_parameters():
+            values = np.asarray(params, dtype=float)
+            if values.shape != (len(param_names),) or not np.all(np.isfinite(values)):
+                raise ValueError("Parameter vector must contain one finite value per configured name")
+            if len(param_units) != len(param_names) or len(param_resolutions) != len(param_names):
+                raise ValueError("Parameter names, units and resolutions must have the same length")
+            if len(set(param_names)) != len(param_names):
+                raise ValueError("Parameter names must be unique")
+            assignments = dict(self.config.get("fixed_parameters") or {})
+            if set(assignments).intersection(param_names):
+                raise ValueError("Fixed and optimized parameter names must not overlap")
+            assignments.update(zip(param_names, values))
+            if not self.apply_parameter_values(assignments, units=dict(zip(param_names, param_units)),
+                                               resolutions=dict(zip(param_names, param_resolutions))):
                 return False
-            for i, (name, unit) in enumerate(zip(param_names, param_units)):
-                if i < len(params):
-                    resolution = param_resolutions[i] if i < len(param_resolutions) else None
-                    if not self.set_parameter(name, params[i], unit=unit, resolution=resolution):
-                        return False
+            self.current_params = values.copy()
             return True
         except Exception as e:
             print(f"Failed to set parameters: {e}")
@@ -630,13 +788,27 @@ class HFSSAdapter(SimulatorAdapter):
 
     def simulate(self) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
         """执行仿真并返回结果"""
-        if not self.app:
+        self.last_result_bundle = None
+        if not self.app or not self._parameter_state_valid:
             return None, None, None
 
         setup_name = self.config.get('setup_name', 'Setup1')
         skip_simulation = self.config.get('skip_simulation', False)
 
         try:
+            if skip_simulation and (not self.source_project_sha256 or
+                    file_sha256(self.original_project_path) != self.source_project_sha256):
+                raise RuntimeError("Existing-results source changed since connection")
+            parameters = self.capture_current_parameter_state()
+            self._result_context = {
+                "acquisition_id": uuid.uuid4().hex, "started_at_unix": time.time(),
+                "project": self.work_project_path, "design": self.config.get("design_name"),
+                "setup": setup_name, "sweep": self.config.get("sweep_name"),
+                "parameters": parameters, "evaluation_mode": self.evaluation_mode,
+                "solved_this_call": False,
+                "execution_fingerprint": self.execution_fingerprint,
+                "source_sha256": self.source_project_sha256,
+            }
             if skip_simulation:
                 print(f"Skipping simulation and reading results directly (Setup: {setup_name})...")
             else:
@@ -656,8 +828,15 @@ class HFSSAdapter(SimulatorAdapter):
 
                 if not success:
                     return None, None, None
+                self._result_context["solved_this_call"] = True
+                self._result_context["solve_target"] = solve_target
+
+            if self.capture_current_parameter_state() != parameters:
+                raise RuntimeError("AEDT parameters changed during result acquisition")
 
             results = self._get_solution_data()
+            if skip_simulation and file_sha256(self.original_project_path) != self.source_project_sha256:
+                raise RuntimeError("Existing-results source changed while reading")
             try:
                 import gc
                 gc.collect()
@@ -666,11 +845,13 @@ class HFSSAdapter(SimulatorAdapter):
             return results
 
         except Exception as e:
+            self.last_result_bundle = None
             print(f"Simulation error: {e}")
             return None, None, None
 
     def _get_solution_data(self) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
         """获取S参数数据。"""
+        self.last_result_bundle = None
         try:
             results = self.config.get('results', {})
             s11_expr = results.get('s11', 'dB(S(1,1))')
@@ -681,13 +862,24 @@ class HFSSAdapter(SimulatorAdapter):
                 freqs, s11_data = self._get_trace_data_via_report(s11_expr)
             if freqs is None:
                 return None, None, None
+            traces = {"s11": TraceData(s11_expr, freqs, s11_data,
+                                       source=dict(self._last_trace_source))}
 
             s12_data = None
             if results.get('s12') or results.get('s21'):
-                _, s12_raw = self._get_solution_data_direct(s12_expr)
+                s12_freqs, s12_raw = self._get_solution_data_direct(s12_expr)
                 if s12_raw is None:
-                    _, s12_raw = self._get_trace_data_via_report(s12_expr)
+                    s12_freqs, s12_raw = self._get_trace_data_via_report(s12_expr)
+                if s12_raw is None or s12_freqs is None:
+                    raise ValueError("Configured isolation trace is missing")
                 s12_data = s12_raw
+                traces["s12"] = TraceData(s12_expr, s12_freqs, s12_raw,
+                                          source=dict(self._last_trace_source))
+
+            if self._result_context.get("parameters") is not None:
+                if self.capture_current_parameter_state() != self._result_context["parameters"]:
+                    raise RuntimeError("AEDT parameters changed while traces were being read")
+            self.last_result_bundle = ResultBundle(traces, dict(self._result_context))
 
             return freqs, s11_data, s12_data
 
@@ -700,7 +892,11 @@ class HFSSAdapter(SimulatorAdapter):
         if solution is None or isinstance(solution, bool):
             return None, None
 
-        freqs = np.array(getattr(solution, 'primary_sweep_values', []))
+        if getattr(solution, "primary_sweep", "Freq") != "Freq":
+            return None, None
+        if len(getattr(solution, "variations", [{}])) != 1:
+            return None, None
+        freqs = np.asarray(getattr(solution, 'primary_sweep_values', []))
         if freqs.size == 0:
             return None, None
 
@@ -720,15 +916,15 @@ class HFSSAdapter(SimulatorAdapter):
         if values is None or values.size == 0:
             return None, None
 
-        if values.ndim > 1:
-            values = values.flatten()
-
-        if len(values) != len(freqs):
-            min_len = min(len(values), len(freqs))
-            freqs = freqs[:min_len]
-            values = values[:min_len]
-
-        return freqs, values
+        try:
+            unit = (getattr(solution, "units_sweeps", {}) or {}).get("Freq") or self.config.get("frequency_unit")
+            freqs = frequency_to_ghz(freqs, unit)
+            trace = TraceData("solution", freqs, values)
+            self._last_trace_source["frequency_unit_original"] = unit
+            return trace.frequencies_ghz, trace.values
+        except (ValueError, TypeError) as exc:
+            print(f"Rejected solution series: {exc}")
+            return None, None
 
     @staticmethod
     def _to_scalar(value: Any):
@@ -804,12 +1000,59 @@ class HFSSAdapter(SimulatorAdapter):
         formula: str,
     ) -> list[tuple[float, float, float]]:
         """Read a full 3D far-field grid from SolutionData."""
-        coords, values = solution_data.get_expression_data(
-            expression,
-            formula=formula,
-            sweeps=["Theta", "Phi"],
-        )
-        return self._normalize_far_field_rows(coords, values)
+        if hasattr(solution_data, "get_expression_data"):
+            coords, values = solution_data.get_expression_data(
+                expression,
+                formula=formula,
+                sweeps=["Theta", "Phi"],
+            )
+            return self._normalize_far_field_rows(coords, values)
+
+        try:
+            theta_values = [float(self._to_scalar(value)) for value in solution_data.variation_values("Theta")]
+            phi_values = [float(self._to_scalar(value)) for value in solution_data.variation_values("Phi")]
+        except Exception as exc:
+            raise RuntimeError(f"SolutionData does not expose Theta/Phi variation values: {exc}") from exc
+
+        try:
+            if formula == "db10" and hasattr(solution_data, "data_db10"):
+                values = solution_data.data_db10(expression)
+            elif hasattr(solution_data, "data_real"):
+                values = solution_data.data_real(expression)
+            elif hasattr(solution_data, "data_magnitude"):
+                values = solution_data.data_magnitude(expression)
+            else:
+                raise AttributeError("no supported data accessor")
+        except Exception as exc:
+            raise RuntimeError(f"SolutionData does not expose far-field values for {expression}: {exc}") from exc
+
+        value_array = np.asarray(values, dtype=float).ravel()
+        if value_array.size == 0:
+            raise RuntimeError("SolutionData returned an empty far-field value array.")
+
+        rows: list[tuple[float, float, float]] = []
+        expected_grid = len(theta_values) * len(phi_values)
+        if expected_grid == value_array.size:
+            index = 0
+            for theta in theta_values:
+                for phi in phi_values:
+                    rows.append((float(theta), float(phi), float(value_array[index])))
+                    index += 1
+        elif len(theta_values) == 1 and value_array.size == len(phi_values):
+            rows = [(float(theta_values[0]), float(phi), float(value)) for phi, value in zip(phi_values, value_array)]
+        elif len(phi_values) == 1 and value_array.size == len(theta_values):
+            rows = [(float(theta), float(phi_values[0]), float(value)) for theta, value in zip(theta_values, value_array)]
+        elif value_array.size == 1 and theta_values and phi_values:
+            rows = [(float(theta_values[0]), float(phi_values[0]), float(value_array[0]))]
+        else:
+            raise RuntimeError(
+                "SolutionData far-field dimensions are unsupported: "
+                f"theta={len(theta_values)}, phi={len(phi_values)}, values={value_array.size}."
+            )
+
+        if not rows:
+            raise RuntimeError("No numeric Theta/Phi/gain samples were parsed from SolutionData.")
+        return rows
 
     def _compute_peak_loss_metrics(
         self,
@@ -829,6 +1072,8 @@ class HFSSAdapter(SimulatorAdapter):
         all_rows = list(rows)
         if not all_rows:
             raise RuntimeError("Far-field rows are empty.")
+        if not np.all(np.isfinite(np.asarray(all_rows, dtype=float))):
+            raise RuntimeError("Far-field samples contain NaN/Inf")
 
         def _angular_delta_deg(angle_a: float, angle_b: float) -> float:
             return abs((float(angle_a) - float(angle_b) + 180.0) % 360.0 - 180.0)
@@ -948,6 +1193,37 @@ class HFSSAdapter(SimulatorAdapter):
             "gain_db": gains,
         }
 
+    def _far_field_variables(self):
+        manager = getattr(self.app, "variable_manager", None)
+        return ({name: self._read_parameter_expression(name) for name in manager.independent_variables}
+                if manager is not None else {})
+
+    def _verify_far_field_context(self, solution, requested, freq):
+        returned = self._read_solution_variation(solution) if requested else {}
+        for name, expression in requested.items():
+            if (name not in returned or not self._assignment_matches(name, returned[name])
+                    or self._read_parameter_expression(name) != expression):
+                raise RuntimeError("Far-field variation mismatch: " + name)
+        actual_freqs = solution.variation_values("Freq")
+        unit = (getattr(solution, "units_sweeps", {}) or {}).get("Freq")
+        actual = frequency_to_ghz(actual_freqs, unit)
+        number, expected_unit = self._split_numeric_unit(freq)
+        expected = frequency_to_ghz([number], expected_unit)
+        if len(actual) != 1 or not np.allclose(actual, expected, rtol=1e-10, atol=1e-12):
+            raise RuntimeError("Far-field frequency mismatch")
+        return {"requested_variation": requested.copy(), "returned_variation": returned,
+                "variation_verified": bool(requested), "frequency_ghz": float(actual[0]),
+                "frequency_unit_original": unit}
+
+    @staticmethod
+    def _full_sphere_rows(rows):
+        theta = sorted({r[0] for r in rows})
+        phi = sorted({r[1] % 360 for r in rows})
+        if len(theta) < 3 or len(phi) < 8 or abs(theta[0]) > 1e-6 or abs(theta[-1]-180) > 1e-6:
+            return False
+        gaps = [b-a for a,b in zip(phi,phi[1:])] + [phi[0]+360-phi[-1]]
+        return max(gaps) <= 90+1e-6 and len({(r[0],r[1] % 360) for r in rows}) == len(theta)*len(phi)
+
     def _attempt_far_field_direct_query(
         self,
         setup_sweep_name: str,
@@ -972,12 +1248,13 @@ class HFSSAdapter(SimulatorAdapter):
         ]
 
         errors: list[str] = []
+        requested = self._far_field_variables()
         for attempt in attempts:
             solution_data = self.app.post.get_solution_data_per_variation(
                 "Far Fields",
                 setup_sweep_name=setup_sweep_name,
                 context=["Context:=", sphere_name],
-                sweeps={"Theta": "All", "Phi": "All", "Freq": freq},
+                sweeps={**{n:[v] for n,v in requested.items()}, "Theta": "All", "Phi": "All", "Freq": freq},
                 expressions=attempt["query_expression"],
             )
             if not solution_data:
@@ -990,16 +1267,87 @@ class HFSSAdapter(SimulatorAdapter):
                     attempt["result_expression"],
                     attempt["formula"],
                 )
+                provenance = self._verify_far_field_context(solution_data, requested, freq)
+                if not self._full_sphere_rows(rows):
+                    raise RuntimeError("Direct far-field data does not cover a full sampled sphere")
                 return rows, {
+                    **provenance,
                     "method": attempt["label"],
                     "setup": setup_sweep_name,
                     "context": ["Context:=", sphere_name],
                     "expression": attempt["query_expression"],
                     "formula": attempt["formula"],
+                    "angular_scope": "sampled_sphere",
                 }
             except Exception as exc:
                 errors.append(f"{attempt['label']}: {exc}")
 
+        raise RuntimeError(" ; ".join(errors))
+
+    def _attempt_far_field_cut_queries(
+        self,
+        setup_sweep_name: str,
+        sphere_name: str,
+        freq: str,
+        expression: str,
+    ) -> tuple[list[tuple[float, float, float]], dict]:
+        """Query four fixed-phi cuts to avoid the AEDT 2023.2 2D-grid bug."""
+        attempts = [
+            {
+                "label": "fixed_phi_raw_expr_db10",
+                "query_expression": expression,
+                "result_expression": expression,
+                "formula": "db10",
+            },
+            {
+                "label": "fixed_phi_wrapped_expr_real",
+                "query_expression": f"dB({expression})",
+                "result_expression": f"dB({expression})",
+                "formula": "real",
+            },
+        ]
+        errors: list[str] = []
+        requested_phis = (0.0, 180.0, 90.0, 270.0)
+        requested = self._far_field_variables()
+        for attempt in attempts:
+            combined_rows: list[tuple[float, float, float]] = []
+            attempt_errors: list[str] = []
+            for phi_deg in requested_phis:
+                solution_data = self.app.post.get_solution_data_per_variation(
+                    "Far Fields",
+                    setup_sweep_name=setup_sweep_name,
+                    context=["Context:=", sphere_name],
+                    sweeps={**{n:[v] for n,v in requested.items()}, "Theta": "All", "Phi": f"{phi_deg:g}deg", "Freq": freq},
+                    expressions=attempt["query_expression"],
+                )
+                if not solution_data:
+                    attempt_errors.append(f"phi={phi_deg:g}: no solution data")
+                    continue
+                try:
+                    provenance = self._verify_far_field_context(solution_data, requested, freq)
+                    cut_rows = self._extract_far_field_rows_from_solution_data(
+                        solution_data,
+                        attempt["result_expression"],
+                        attempt["formula"],
+                    )
+                    cut_rows = [(theta, phi_deg, gain_db) for theta, _phi, gain_db in cut_rows]
+                    if len(cut_rows) < 10:
+                        raise RuntimeError(f"only {len(cut_rows)} theta samples")
+                    combined_rows.extend(cut_rows)
+                except Exception as exc:
+                    attempt_errors.append(f"phi={phi_deg:g}: {exc}")
+            if not attempt_errors and len(combined_rows) >= 40:
+                return combined_rows, {
+                    **provenance,
+                    "method": attempt["label"],
+                    "setup": setup_sweep_name,
+                    "context": ["Context:=", sphere_name],
+                    "expression": attempt["query_expression"],
+                    "formula": attempt["formula"],
+                    "fixed_phi_deg": list(requested_phis),
+                    "angular_scope": "principal_cuts",
+                }
+            errors.append(f"{attempt['label']}: " + " ; ".join(attempt_errors))
         raise RuntimeError(" ; ".join(errors))
 
     def _attempt_far_field_report_query(
@@ -1008,72 +1356,123 @@ class HFSSAdapter(SimulatorAdapter):
         sphere_name: str,
         freq: str,
         expression: str,
+        phi_samples_deg=None,
     ) -> tuple[list[tuple[float, float, float]], dict]:
-        """Fallback to the official far-field report-object path."""
-        attempts = [
-            {
-                "label": "report_obj_raw_expr_db10",
-                "query_expression": expression,
-                "result_expression": expression,
-                "formula": "db10",
-            },
-            {
-                "label": "report_obj_wrapped_expr_real",
-                "query_expression": f"dB({expression})",
-                "result_expression": f"dB({expression})",
-                "formula": "real",
-            },
-        ]
+        """Export four fixed-Phi rectangular reports through AEDT ReportSetup.
 
+        AEDT 2023.2 can collapse Theta when far-field SolutionData is queried
+        directly.  The low-level report CSV path preserves all Theta samples.
+        """
+        requested_phis = tuple(phi_samples_deg) if phi_samples_deg is not None else (0.0, 180.0, 90.0, 270.0)
+        if (any(not math.isfinite(float(p)) or not 0 <= float(p) < 360 for p in requested_phis)
+                or len(set(requested_phis)) != len(requested_phis)
+                or (phi_samples_deg is not None and len(requested_phis) < 8)):
+            raise ValueError("Sphere sampling requires at least eight unique finite Phi angles in [0,360)")
+        query_expression = expression if str(expression).startswith("dB(") else f"dB({expression})"
+        report_prefix = f"FFCut_{int(time.time() * 1000)}"
+        export_dir = Path(self._get_temp_dir()) / "far_field_report_exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        combined_rows: list[tuple[float, float, float]] = []
         errors: list[str] = []
-        for attempt in attempts:
-            report = self.app.post.reports_by_category.far_field(
-                expressions=attempt["query_expression"],
+
+        variation_names: list[str] = []
+        requested = self._far_field_variables()
+        try:
+            template = self.app.post.reports_by_category.far_field(
+                expressions=query_expression,
                 setup=setup_sweep_name,
                 sphere_name=sphere_name,
-                Freq=[freq],
-                Theta=["All"],
-                Phi=["All"],
             )
-            report.report_type = "3D Polar Plot"
-            report.primary_sweep = "Phi"
-            report.secondary_sweep = "Theta"
+            variation_names = [
+                str(name)
+                for name in template.variations
+                if str(name) not in {"Theta", "Phi", "Freq"}
+            ]
+        except Exception:
+            variation_names = []
 
+        for index, phi_deg in enumerate(requested_phis):
+            report_name = f"{report_prefix}_{index}"
+            csv_path = export_dir / f"{report_name}.csv"
+            families: list[Any] = [
+                "Theta:=", ["All"],
+                "Phi:=", [f"{phi_deg:g}deg"],
+                "Freq:=", [freq],
+            ]
+            for variable_name in variation_names:
+                families.extend([f"{variable_name}:=", [requested.get(variable_name, "Nominal")]])
             try:
-                plot_name = f"PointingErrorProbe_{int(time.time() * 1000)}"
-                report.create(plot_name)
-            except Exception:
-                pass
-
-            try:
-                solution_data = report.get_solution_data()
-                if not solution_data:
-                    errors.append(f"{attempt['label']}: no solution data")
-                    continue
-
-                rows = self._extract_far_field_rows_from_solution_data(
-                    solution_data,
-                    attempt["result_expression"],
-                    attempt["formula"],
+                self.app.oreportsetup.CreateReport(
+                    report_name,
+                    "Far Fields",
+                    "Rectangular Plot",
+                    setup_sweep_name,
+                    ["Context:=", sphere_name],
+                    families,
+                    ["X Component:=", "Theta", "Y Component:=", [query_expression]],
                 )
-                return rows, {
-                    "method": attempt["label"],
-                    "setup": setup_sweep_name,
-                    "sphere": sphere_name,
-                    "expression": attempt["query_expression"],
-                    "formula": attempt["formula"],
-                    "report_type": report.report_type,
-                }
+                self.app.oreportsetup.ExportToFile(report_name, str(csv_path), False)
+                with csv_path.open("r", encoding="utf-8-sig", newline="") as stream:
+                    reader = csv.DictReader(stream)
+                    if not reader.fieldnames:
+                        raise RuntimeError("exported CSV has no header")
+                    theta_key = next((key for key in reader.fieldnames if "theta" in key.lower()), None)
+                    phi_key = next((key for key in reader.fieldnames if "phi" in key.lower()), None)
+                    freq_key = next((key for key in reader.fieldnames if "freq" in key.lower()), None)
+                    if not freq_key:
+                        raise RuntimeError("Far-field CSV has no frequency column")
+                    freq_unit = re.search(r"\[([^\]]+)\]", freq_key)
+                    if freq_unit is None:
+                        raise RuntimeError("Far-field CSV frequency unit is missing")
+                    expected_number, expected_unit = self._split_numeric_unit(freq)
+                    expected_ghz = frequency_to_ghz([expected_number], expected_unit)[0]
+                    value_key = next(
+                        (key for key in reversed(reader.fieldnames) if key not in {theta_key, phi_key} and "freq" not in key.lower()),
+                        None,
+                    )
+                    if not theta_key or not value_key:
+                        raise RuntimeError(f"unsupported CSV columns: {reader.fieldnames}")
+                    cut_rows = []
+                    for row in reader:
+                        actual_ghz = frequency_to_ghz([float(row[freq_key])], freq_unit.group(1))[0]
+                        if not math.isclose(actual_ghz, expected_ghz, rel_tol=1e-10, abs_tol=1e-12):
+                            raise RuntimeError("Far-field CSV frequency mismatch")
+                        theta_value = float(row[theta_key])
+                        phi_value = float(row[phi_key]) if phi_key else float(phi_deg)
+                        gain_db = float(row[value_key])
+                        cut_rows.append((theta_value, phi_value, gain_db))
+                if len(cut_rows) < 10:
+                    raise RuntimeError(f"only {len(cut_rows)} theta samples")
+                combined_rows.extend(cut_rows)
             except Exception as exc:
-                errors.append(f"{attempt['label']}: {exc}")
+                errors.append(f"phi={phi_deg:g}: {exc}")
             finally:
                 try:
-                    report.delete()
+                    self.app.oreportsetup.DeleteReports([report_name])
+                except Exception:
+                    pass
+                try:
+                    csv_path.unlink()
                 except Exception:
                     pass
 
-        raise RuntimeError(" ; ".join(errors))
-
+        if errors or len(combined_rows) < 40:
+            raise RuntimeError(" ; ".join(errors) or f"only {len(combined_rows)} samples")
+        if any(self._read_parameter_expression(n) != v for n,v in requested.items()):
+            raise RuntimeError("Live parameters changed during far-field report acquisition")
+        full_sphere = phi_samples_deg is not None and self._full_sphere_rows(combined_rows)
+        if phi_samples_deg is not None and not full_sphere:
+            raise RuntimeError("Requested sphere sampling has incomplete Theta/Phi coverage")
+        return combined_rows, {
+            "requested_variation": requested, "variation_verified": bool(requested),
+            "variation_read_method": "explicit_report_families_and_live_state",
+            "method": "report_csv_fixed_phi",
+            "setup": setup_sweep_name,
+            "context": ["Context:=", sphere_name],
+            "expression": query_expression,
+            "fixed_phi_deg": list(requested_phis),
+            "angular_scope": "sampled_sphere" if full_sphere else "principal_cuts",
+        }
     def get_far_field_peak_loss(
         self,
         freq: str,
@@ -1085,6 +1484,7 @@ class HFSSAdapter(SimulatorAdapter):
         plane_phi_deg: float | None = None,
         plane_tolerance_deg: float = 1e-6,
         plane_include_opposite: bool = True,
+        phi_samples_deg=None,
     ) -> dict:
         """Extract peak-loss and pointing-error metrics for one frequency point.
 
@@ -1103,14 +1503,18 @@ class HFSSAdapter(SimulatorAdapter):
         for candidate_setup in setup_candidates:
             for attempt in (
                 self._attempt_far_field_direct_query,
+                self._attempt_far_field_cut_queries,
                 self._attempt_far_field_report_query,
             ):
+                if phi_samples_deg is not None and attempt == self._attempt_far_field_cut_queries:
+                    continue
                 try:
                     rows, acquisition = attempt(
                         candidate_setup,
                         sphere_name,
                         freq,
                         expression,
+                        **({"phi_samples_deg": phi_samples_deg} if attempt == self._attempt_far_field_report_query else {}),
                     )
                     result = {
                         "frequency": freq,
@@ -1126,6 +1530,10 @@ class HFSSAdapter(SimulatorAdapter):
                             plane_include_opposite=plane_include_opposite,
                         )
                     )
+                    scope = acquisition.get("angular_scope", "unverified")
+                    result["peak_scope"] = "principal_cut" if plane_phi_deg is not None else scope
+                    if scope != "sampled_sphere":
+                        result["sampled_peak_direction"] = result.pop("global_peak_direction")
                     if plane_phi_deg is not None:
                         plane_cuts: dict[str, Any] = {}
                         primary_cut = self._extract_plane_cut(
@@ -1144,8 +1552,18 @@ class HFSSAdapter(SimulatorAdapter):
                         )
                         if orthogonal_cut is not None:
                             plane_cuts["orthogonal_plane"] = orthogonal_cut
-                        if plane_cuts:
-                            result["plane_cuts"] = plane_cuts
+                        required_planes = ("primary_plane", "orthogonal_plane")
+                        incomplete = [
+                            plane_id
+                            for plane_id in required_planes
+                            if plane_id not in plane_cuts
+                            or len(plane_cuts[plane_id].get("cut_angle_deg", [])) < 10
+                        ]
+                        if incomplete:
+                            raise RuntimeError(
+                                "Incomplete principal-plane cuts: " + ", ".join(incomplete)
+                            )
+                        result["plane_cuts"] = plane_cuts
                     return result
                 except Exception as exc:
                     errors.append(f"{candidate_setup}/{attempt.__name__}: {exc}")
@@ -1167,6 +1585,7 @@ class HFSSAdapter(SimulatorAdapter):
         plane_phi_deg: float | None = None,
         plane_tolerance_deg: float = 1e-6,
         plane_include_opposite: bool = True,
+        phi_samples_deg=None,
     ) -> dict:
         """Extract peak-loss and pointing-error metrics across a discrete frequency band."""
         freq_list = list(freqs) if freqs is not None else self.build_frequency_list(
@@ -1187,6 +1606,7 @@ class HFSSAdapter(SimulatorAdapter):
                 plane_phi_deg=plane_phi_deg,
                 plane_tolerance_deg=plane_tolerance_deg,
                 plane_include_opposite=plane_include_opposite,
+                phi_samples_deg=phi_samples_deg,
             )
             for freq in freq_list
         ]
@@ -1216,105 +1636,108 @@ class HFSSAdapter(SimulatorAdapter):
             "per_frequency": band_results,
         }
 
+    def capture_geometry_snapshot(self, object_names: list[str]) -> dict:
+        """Read selected live CAD extents without bulk-cache parsing or CAD edits."""
+        if not self.app:
+            raise RuntimeError("Geometry snapshot requires a connected model")
+        if (not isinstance(object_names, list) or not object_names or
+                any(not isinstance(name, str) or not name.strip() for name in object_names) or
+                len(set(object_names)) != len(object_names)):
+            raise ValueError("Geometry snapshot requires unique nonempty object names")
+        modeler = self.app.modeler
+        available = set(modeler.object_names)
+        missing = set(object_names) - available
+        if missing:
+            raise ValueError(f"Geometry snapshot objects not found: {sorted(missing)}")
+        unit = modeler.model_units
+        if not isinstance(unit, str) or not unit:
+            raise RuntimeError("Geometry snapshot requires explicit model units")
+        objects = {}
+        for name in object_names:
+            obj = modeler.objects[name]
+            if obj.object_type == "Unclassified":
+                raise RuntimeError(f"Cannot verify unclassified geometry {name!r}")
+            bbox = np.asarray(obj.bounding_box, dtype=float)
+            if (bbox.shape != (6,) or not np.all(np.isfinite(bbox)) or
+                    np.any(bbox[3:] < bbox[:3])):
+                raise RuntimeError(f"Invalid live bounding box for {name!r}")
+            objects[name] = {"bounding_box": bbox.tolist(),
+                             "dimensions": (bbox[3:] - bbox[:3]).tolist()}
+        return {"model_unit": unit, "objects": objects,
+                "parameters": self.capture_current_parameter_state()}
+
+    def _read_solution_variation(self, solution) -> dict[str, str]:
+        """Read explicit native-unit values, avoiding ambiguous PyAEDT Quantity units."""
+        wrapped = {name: str(value) for name, value in
+                   (getattr(solution, "active_variation", {}) or {}).items()}
+        self._last_trace_source["pyaedt_returned_variation"] = wrapped
+        native = getattr(solution, "nominal_variation", None)
+        if native is None or not hasattr(native, "GetDesignVariableValue"):
+            self._last_trace_source["variation_read_method"] = "active_variation"
+            return wrapped
+        returned = {}
+        for name in native.GetDesignVariableNames():
+            # AEDT's default may be SI while GetDesignVariableUnits reports native units.
+            value = native.GetDesignVariableValue(name, False)
+            unit = native.GetDesignVariableUnits(name)
+            if isinstance(value, (bool, str)) or not math.isfinite(float(value)):
+                raise RuntimeError(f"Invalid native result variation value for {name!r}")
+            if not isinstance(unit, str):
+                raise RuntimeError(f"Missing native result variation unit for {name!r}")
+            returned[name] = f"{float(value):.17g}{unit}"
+        self._last_trace_source["variation_read_method"] = "native_value_explicit_non_si"
+        return returned
+
     def _get_solution_data_direct(self, trace_expr: str) -> Tuple[np.ndarray, np.ndarray]:
-        """Directly load solution data without binding to a case-specific setup string."""
+        """Read only the configured setup/sweep and the current nominal variation."""
         if not self.app:
             return None, None
-
-        # First try the setup objects exposed by the active design. This is the most
-        # stable path across AEDT/PyAEDT versions because it lets the library resolve
-        # the correct nominal sweep itself.
-        setup_objects = []
-        for setup in getattr(self.app, 'setups', []) or []:
-            if setup is None:
-                continue
-            setup_name = getattr(setup, 'name', None)
-            if self.config.get('setup_name') and setup_name and setup_name != self.config.get('setup_name'):
-                continue
-            setup_objects.append(setup)
-
-        for setup in setup_objects:
-            try:
-                solution = setup.get_solution_data(expressions=trace_expr)
-                freqs, values = self._extract_solution_series(solution)
-                if freqs is not None and self._solution_frequency_coverage_ok(
-                    freqs,
-                    f"setup object {getattr(setup, 'name', 'unknown')}",
-                ):
-                    print(f"Direct solution data loaded: {len(freqs)} points")
-                    return freqs, values
-            except Exception as e:
-                print(f"Direct setup data failed ({getattr(setup, 'name', 'unknown')}): {e}")
-
-        # Fall back to the post processor with progressively more explicit sweep names.
+        if not self.config.get("setup_name"):
+            raise ValueError("An explicit setup_name is required for result acquisition")
+        manager = getattr(self.app, "variable_manager", None)
+        variations = ({name: [self._read_parameter_expression(name)]
+                       for name in manager.independent_variables} if manager is not None else None)
         for setup_sweep_name in self._iter_candidate_setup_sweeps():
             try:
-                solution = self.app.post.get_solution_data(
-                    expressions=trace_expr,
-                    setup_sweep_name=setup_sweep_name,
-                    report_category="Standard",
-                )
+                self._last_trace_source = {
+                    "setup_sweep": setup_sweep_name, "expression": trace_expr,
+                    "requested_variation": dict(variations or {}),
+                    "method": "post_solution_data",
+                }
+                query = dict(expressions=trace_expr, setup_sweep_name=setup_sweep_name,
+                             report_category="Standard", primary_sweep_variable="Freq")
+                if variations is not None:
+                    # PyAEDT augments this dict with intrinsic sweeps (e.g. Freq=All).
+                    # Keep the requested design-variable contract independent of that mutation.
+                    query["variations"] = {name: list(values) for name, values in variations.items()}
+                solution = self.app.post.get_solution_data(**query)
                 freqs, values = self._extract_solution_series(solution)
                 if freqs is not None and self._solution_frequency_coverage_ok(freqs, setup_sweep_name):
-                    print(f"Direct solution data loaded: {len(freqs)} points")
+                    returned = self._read_solution_variation(solution)
+                    if variations is not None:
+                        for name in variations:
+                            if name not in returned or not self._assignment_matches(name, str(returned[name])):
+                                raise RuntimeError(
+                                    f"Result variation mismatch for {name!r}: "
+                                    f"requested={variations[name]!r}, returned={returned.get(name)!r}, "
+                                    f"model={self._read_parameter_expression(name)!r}")
+                    self._last_trace_source["returned_variation"] = returned
+                    self._last_trace_source["variation_verified"] = variations is not None
                     return freqs, values
-            except Exception as e:
-                print(f"Direct solution data failed ({setup_sweep_name}): {e}")
-
-        # Last attempt: let PyAEDT choose the nominal sweep on its own.
-        try:
-            solution = self.app.post.get_solution_data(
-                expressions=trace_expr,
-                report_category="Standard",
-            )
-            freqs, values = self._extract_solution_series(solution)
-            if freqs is not None and self._solution_frequency_coverage_ok(freqs, "default sweep"):
-                print(f"Direct solution data loaded: {len(freqs)} points")
-                return freqs, values
-        except Exception as e:
-            print(f"Direct solution data failed (default sweep): {e}")
-
+            except Exception as exc:
+                print(f"Result acquisition failed ({setup_sweep_name}): {exc}")
         return None, None
 
     def _get_trace_data_via_report(self, trace_expr: str) -> Tuple[np.ndarray, np.ndarray]:
-        """通过兼容的结果接口获取 trace 数据。
+        """Compatibility alias; never fall back to a different solution context."""
+        return self._get_solution_data_direct(trace_expr)
 
-        这里不再依赖 create_report 的返回值，因为当前 PyAEDT 版本返回的是
-        bool，而不是可继续读取的 report 对象。
-        """
-        if not self.app:
-            return None, None
-
-        try:
-            for setup_sweep_name in self._iter_candidate_setup_sweeps():
-                try:
-                    solution = self.app.post.get_solution_data(
-                        expressions=trace_expr,
-                        setup_sweep_name=setup_sweep_name,
-                        report_category="Standard",
-                    )
-                    freqs, values = self._extract_solution_series(solution)
-                    if freqs is not None and self._solution_frequency_coverage_ok(freqs, setup_sweep_name):
-                        print(f"Trace data loaded: {len(freqs)} points ({setup_sweep_name})")
-                        return freqs, values
-                except Exception as e:
-                    print(f"Trace data failed ({setup_sweep_name}): {e}")
-
-            solution = self.app.post.get_solution_data(
-                expressions=trace_expr,
-                report_category="Standard",
-            )
-            freqs, values = self._extract_solution_series(solution)
-            if freqs is None or not self._solution_frequency_coverage_ok(freqs, "default report"):
-                print(f"Trace data empty ({trace_expr})")
-                return None, None
-
-            return freqs, values
-
-        except Exception as e:
-            print(f"Trace data failed ({trace_expr}): {e}")
-            return None, None
-
+    def get_trace_data(self, trace_expr: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Load an arbitrary scalar report trace from the solved HFSS result."""
+        freqs, values = self._get_solution_data_direct(trace_expr)
+        if freqs is None:
+            freqs, values = self._get_trace_data_via_report(trace_expr)
+        return freqs, values
     def save_results_to_csv(self, output_dir: str = None, sim_id: int = 0) -> bool:
         """保存仿真结果到CSV文件"""
         if not self.app:
@@ -1362,23 +1785,49 @@ class HFSSAdapter(SimulatorAdapter):
             output_path = os.path.join(output_dir, f"{original_name}_{sim_tag}_best.aedt")
 
         try:
-            if self.best_params is not None:
-                best_params = np.asarray(self.best_params, dtype=float)
-                if not self.set_parameters(best_params):
-                    print("Failed to restore best parameters before saving")
-                    return False
-                print(f"Restored best parameters before save: {best_params.tolist()}")
-
-                # Re-solve once at the restored best point so the saved project opens
-                # with result data already matching the visible geometry/variables.
-                freqs, s11, _ = self.simulate()
-                if freqs is None or s11 is None:
-                    print("Failed to re-simulate best parameters before saving")
-                    return False
-                print("Best-parameter re-simulation completed before save")
-
-            if self.app:
-                self.app.save_project(output_path)
+            if not self.app or self.best_params is None or self.last_result_bundle is None:
+                raise RuntimeError("Best export requires a verified solved result bundle")
+            if self.current_params is None or not np.array_equal(self.current_params, self.best_params):
+                raise RuntimeError("Current parameters do not match the verified export point")
+            provenance = self.last_result_bundle.provenance
+            if not provenance.get("solved_this_call") or not self._parameter_state_valid:
+                raise RuntimeError("Best export requires results solved for the current model")
+            if self.capture_current_parameter_state() != provenance.get("parameters"):
+                raise RuntimeError("Model changed after export verification")
+            destination = Path(output_path).resolve()
+            if destination == Path(self.original_project_path).resolve() or destination.exists():
+                raise ValueError("Best export must use a new path separate from the source")
+            work_path = Path(self.work_project_path).resolve()
+            if work_path == Path(self.original_project_path).resolve() or destination == work_path:
+                raise ValueError("Best export requires a separate protected work project")
+            # SaveAs changes the active project. A later baseline restore followed by
+            # disconnect/save would overwrite that exported file with baseline values.
+            # Persist the verified work model, then copy only the AEDT model snapshot.
+            # Solver caches stay with the work project; the snapshot needs a fresh solve.
+            if self.app.save_project() is not True:
+                raise RuntimeError("AEDT save_project reported failure")
+            if self.capture_current_parameter_state() != provenance.get("parameters"):
+                raise RuntimeError("Model changed while saving the verified work project")
+            if not work_path.is_file() or work_path.stat().st_size == 0:
+                raise RuntimeError("AEDT did not persist the verified work project")
+            saved_hash = file_sha256(work_path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            created = False
+            try:
+                with destination.open("xb") as target:
+                    created = True
+                    with work_path.open("rb") as source:
+                        shutil.copyfileobj(source, target)
+                    target.flush()
+                    os.fsync(target.fileno())
+                if file_sha256(destination) != saved_hash or file_sha256(work_path) != saved_hash:
+                    raise RuntimeError("Saved model changed during export or snapshot is incomplete")
+            except Exception:
+                if created:
+                    destination.unlink(missing_ok=True)
+                raise
+            if not destination.is_file() or destination.stat().st_size == 0:
+                raise RuntimeError("AEDT did not create the saved project file")
             print(f"Best result saved to: {output_path}")
             return True
         except Exception as e:
@@ -1422,5 +1871,3 @@ class HFSSAdapter(SimulatorAdapter):
     def project_path(self) -> str:
         """获取当前项目路径"""
         return self.work_project_path or self.original_project_path
-
-

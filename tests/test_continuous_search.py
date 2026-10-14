@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 import optimizer.main as main
 from optimizer.core.fitness import FitnessResult
 from optimizer.core.parameter import ParameterManager
+from fake_parameter_state import FakeParameterState
 
 
 def test_continuous_optimizers_default_to_continuous_search():
@@ -213,7 +214,7 @@ def test_simulation_cache_key_matches_resolution_quantization():
     assert key_a != key_c
 
 
-class DuplicateBatchAdapter:
+class DuplicateBatchAdapter(FakeParameterState):
     def __init__(self):
         self.current_params = None
         self.sim_calls = 0
@@ -329,7 +330,7 @@ def test_run_optimization_reuses_cached_result_for_duplicate_candidates(tmp_path
     assert best_result is not None
 
 
-class ConstraintRepairAdapter:
+class ConstraintRepairAdapter(FakeParameterState):
     def __init__(self):
         self.current_params = None
         self.sim_calls = 0
@@ -347,6 +348,7 @@ class ConstraintRepairAdapter:
 
     def simulate(self):
         self.sim_calls += 1
+        self.last_sim_params = self.current_params.copy()
         freqs = np.array([55.0], dtype=float)
         s11 = np.array([-20.0], dtype=float)
         return freqs, s11, None
@@ -434,15 +436,16 @@ def test_run_optimization_repairs_invalid_constraint_before_simulation(tmp_path,
     )
 
     assert adapter.sim_calls == 1
-    assert adapter.current_params[0] == pytest.approx(1.01)
-    assert adapter.current_params[1] == pytest.approx(0.50)
+    assert adapter.last_sim_params[0] == pytest.approx(1.01)
+    assert adapter.last_sim_params[1] == pytest.approx(0.50)
+    assert adapter.current_params.tolist() == [0.0, 0.0]
     assert best_params[0] == pytest.approx(1.01)
     assert best_params[1] == pytest.approx(0.50)
     assert best_cost == pytest.approx(-20.0)
     assert best_result is not None
 
 
-class NonImprovingAdapter:
+class NonImprovingAdapter(FakeParameterState):
     def __init__(self):
         self.current_params = None
         self.sim_calls = 0
