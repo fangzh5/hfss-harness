@@ -1,6 +1,6 @@
 # 0.2.0 迁移与能力边界
 
-0.2.0将优化、扫参和验证接入同一案例执行流程。旧版本及其运行目录应独立保留；不要复用已有journal或覆盖旧best。本版不实现断点续跑/中继，也不新增模型组装能力。
+0.2.0 将优化（opt）、扫参（sweep）和单点验证（val）接入同一案例执行流程，并提供沿线条自动布置过孔、从 AEDT 工程导出 Gerber，以及根据加工包重建几何与材料的 skills。旧版本及其运行目录应独立保留；不要复用已有 journal 或覆盖旧 best。本版不实现断点续跑，也不新增模型组装能力。
 
 ## 安装后建立工作目录
 
@@ -8,7 +8,7 @@
 python -m optimizer.scaffold <新工作目录>
 ```
 
-该命令复制模板、示例AEDT、文档及五项公开工作流到目标目录，遇到同名文件立即拒绝，不覆盖现有项目。包内不含私有Git skill、私有运行日志、求解缓存或用户工程。进入新目录后，用`python -m optimizer.cli configs/<任务>.json`或`hfss-harness configs/<任务>.json`运行；源码checkout仍使用`python optimizer/cli.py <config>`。
+该命令复制模板、AEDT 2023 R2（2023.2）的带过孔示例工程、文档及五项公开 skills 到目标目录，遇到同名文件拒绝覆盖。包内不含私有运行日志、求解缓存或用户工程。进入新目录后，用 `python -m optimizer.cli configs/<任务>.json` 或 `hfss-harness configs/<任务>.json` 运行；源码也支持同一模块入口，原文件形式 `python optimizer/cli.py <config>` 保留。
 
 ## 配置与数据
 
@@ -38,8 +38,8 @@ python -m optimizer.inspect_aedt <工程.aedt> --design <设计> --setup <设置
 
 `hh-pcb`更名为`hh-export-pcb`，`hh-rebuild`更名为`hh-rebuild-pcb`。公开入口为`optimizer.fabrication.native_export`、`cam_import`及`cam_rebuild`，配置/层角色/孔层对必须明确。导出包含实际铜、介质外框GKO、钻孔和逐层叠层；copper/PEC孔默认金属化，明确标注优先。未知材料或工艺字段询问缺项，不静默补物理默认值。
 
-当前原生提取支持mm、Z向等截面实体、闭合直线轮廓及整圆；CAM支持的region/整圆flash/圆钻孔和显式层对按实际解析器范围处理。不支持特征拒绝，不默默漏几何。重建属于几何/材料工作流，不自动恢复端口/边界/netlist或宣称电磁等价；复杂/外部CAM与重建EM追加验证已按本版用户范围移出验收。
+当前原生提取支持mm、Z向等截面实体、闭合直线轮廓及整圆；CAM支持的region/整圆flash/圆钻孔和显式层对按实际解析器范围处理。不支持特征明确拒绝，不遗漏几何后报告成功。重建完成几何和材料，不自动恢复端口、边界、netlist或求解设置；复杂外部CAM及重建电磁等价尚未验证。具体范围见[PCB工作流](pcb-stackup.md)。
 
 ## 兼容性
 
-Python声明范围3.11–3.13，实际干净安装结果见本版RC记录。真实AEDT覆盖为Windows/AEDT2023.2/PyAEDT0.18.1/COM/non-GUI；不把未测试版本、gRPC或共享桌面复用当作已验证。独立拥有会话用于自动关闭，避免影响用户打开的工程。首次新环境先运行只读预检，再验证小任务。
+Python 3.11–3.13 已完成干净安装检查；真实仿真环境为 Windows / AEDT 2023.2 / PyAEDT 0.18.1 / COM / non-GUI。其他版本、gRPC和共享桌面复用尚未验证。自动关闭仅限本次拥有的会话。首次在新环境使用时，先运行只读预检，再验证小任务。过孔入口的可视会话行为见[安全创建过孔](via-creation.md)。

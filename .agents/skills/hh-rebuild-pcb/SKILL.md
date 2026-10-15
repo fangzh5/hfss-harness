@@ -74,13 +74,11 @@ description: Use when reconstructing or auditing an HFSS/AEDT verification model
 
 ## 常用命令
 
-当前公共 `optimizer.fabrication.cam_io` 可直接读取真实Gerber多边形region、整圆flash及圆形Drill，并明确拒绝未支持特征；需要层映射/叠层/材料输入。当前旧 `rebuild_hfss_from_fabrication.py` 仍以自有fabrication.json为输入，不得把该JSON重放称为外部Gerber解析。新的实际CAM规划与隔离结构执行入口见下段；更多特征支持仍在开发，下面旧命令只适用于检查过的兼容中间模型。
+当前公共 `optimizer.fabrication.cam_io` 可读取真实Gerber多边形region、整圆flash及圆形Drill，并明确拒绝未支持特征；需要层映射、叠层和材料输入。公开工作流使用下面的模块入口，历史脚本及私有结构对比工具不随公开包分发。不能把中间JSON重放当作实际Gerber解析。
 
 规划入口`python -m optimizer.fabrication.cam_import <package-dir> --output <new-plan.json>`读取`hfss-stackup-2`和实际Gerber/GKO/Drill，保留逐层材料及孔层对；缺项返回needs_input报告，不启动CAD。数据契约与范围见[叠层与CAM入口](../../../docs/pcb-stackup.md)。此入口只生成规划，不能将planned报告为已重建。输入齐全且已有建模授权时，用`python -m optimizer.fabrication.cam_rebuild <package-dir> --temp-root <temp-dir> --runs-root <runs-dir> --aedt-version <version>`默认启动独立拥有的non-GUI COM会话（仅需要用户视觉确认时加--gui，并核对实际模式）；只在唯一temp工程建模，原生核验、保存重开后归档runs并关闭拥有的会话。当前支持范围/前置拒绝及容差见同一文档，不绕过检查运行未支持拓扑。completed_geometry只代表结构/材料链路，缺项/错误分别为needs_input/failed，不能称为EM等效。已有确认记录需明确整理成该叠层，不静默把旧版或测试专用schema当成当前schema。
 
-旧脚本读取Markdown/JSON中的层高和厚度，但不读取结构化Dk/Df，且仅支持统一介质材料；实际建模必须显式传入已确认的材料名、Dk、Df，缺失或与叠层材料冲突时在CAD连接前拒绝，多材料叠层拒绝使用该入口。新实际CAM入口按hfss-stackup-2逐层建材，旧入口不具备此能力。
-
-旧入口的create_vias是实心铜柱，仅为历史几何预览实现，不是当前钻孔/金属化孔壁重建；现在含过孔输入只允许dry-run，实际建模在CAD连接前拒绝。有过孔的加工包须使用已验证的钻孔/孔壁路径，不可为了运行旧命令将孔转换为铜柱。
+当前CAM入口按 `hfss-stackup-2` 逐层设置材料，不能用单一介质默认值覆盖不同层。过孔按Drill和明确层对钻空、生成已声明的金属化孔壁；不将孔替换成实心铜柱来绕过输入或建模检查。
 
 保留绝对Z及每层材料参数。无文档时不能丢弃JSON中的介质或压扁铜层；有Z列必须读取。未知层、介质孔终层、缺失特征、非法单位/尺寸必须在连接CAD前拒绝，不能静默跳过。生成新HFSS设计做纯结构核验时，显式决定自动开放区域；RadiatingSurface是边界管理对象，不能按普通铜实体查询/计数。
 
@@ -90,13 +88,11 @@ description: Use when reconstructing or auditing an HFSS/AEDT verification model
 
 跨板钻孔的布尔工具须充分伸出板面，避免端面几乎重合；板厚跨度内的实体才是最终孔范围。不能通过放宽核验阈值掩盖失真的孔轮廓，须回读实际圆孔和体积并记录容差。
 
-先检查当前仓库脚本再运行。常见命令：
+先核对当前入口的参数和支持范围。常见命令：
 
 ```powershell
-python scripts\rebuild_hfss_from_fabrication.py <package-dir> --dry-run
-python scripts\rebuild_hfss_from_fabrication.py <package-dir> --output-aedt <out.aedt> --aedt-version <version> --dielectric-material <confirmed-name> --dielectric-permittivity <confirmed-Dk> --dielectric-loss-tangent <confirmed-Df>
-python scripts\compare_hfss_structures.py --source-project <source.aedt> --source-design <design> --rebuilt-project <rebuilt.aedt> --rebuilt-design <design> --output-json <compare.json>
-python -m pytest tests\test_rebuild_hfss_from_fabrication.py -p no:cacheprovider --basetemp .pytest_tmp
+python -m optimizer.fabrication.cam_import <package-dir> --output <new-plan.json>
+python -m optimizer.fabrication.cam_rebuild <package-dir> --temp-root <temp-dir> --runs-root <runs-dir> --aedt-version <version>
 ```
 
 某些机器上AEDT非图形启动可能失败。保留失败诊断，先核对版本、传输与兼容Python环境；不要自动切换GUI绕过用户的无界面调试要求。需要用户视觉确认时才使用显式--gui。

@@ -4,10 +4,9 @@
 
 ## 必需
 
-- 能运行仓库脚本的 Python 环境。
-- 几何/解析脚本需要的仓库依赖。
+- Python 3.11–3.13，安装仓库的 `cam` extra，用于实际CAM读取和几何处理。
 - 加工输入：Gerber 铜层、Excellon Drill、板框和叠层说明。
-- 需要通过 PyAEDT 创建或对比 `.aedt` 时，必须有可用授权的 Ansys Electronics Desktop / HFSS。
+- 实际创建 `.aedt` 时，需要 `hfss` extra 和已安装、已授权的 Ansys Electronics Desktop / HFSS；仅运行 `cam_import` 生成计划不需要启动AEDT。
 
 ## 推荐
 
@@ -31,10 +30,11 @@
 
 ## 验证命令
 
-修改脚本后运行相关测试：
+先检查公开入口是否可用，不创建模型或求解：
 
 ```powershell
-python -m pytest tests\test_rebuild_hfss_from_fabrication.py -p no:cacheprovider --basetemp .pytest_tmp
+python -m optimizer.fabrication.cam_import --help
+python -m optimizer.fabrication.cam_rebuild --help
 ```
 
 如果生成真实模型，检查：

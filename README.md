@@ -2,20 +2,20 @@
 
 `hfss-harness` 是一套基于 PyAEDT 实现、面向 Ansys HFSS/AEDT 的 Python workflow harness，支持参数优化、扫参、固定参数验证、过孔建模，以及 PCB 导出与重建。
 
-仓库保留一个标准示例工程：`hfss/patch.aedt`。真实运行需要本机准备可用的 AEDT/HFSS 环境和授权；仓库不包含 Ansys 软件、许可证、求解缓存或加工输出。
+仓库内包含一个示例工程文件：`hfss/patch.aedt`，版本为 AEDT 2023 R2（2023.2）。实际运行需要本机准备可用的 AEDT/HFSS 环境和授权；仓库不包含 Ansys 软件、许可证、求解缓存或加工输出。
 
 ## 版本说明
 
-- 当前版本：`0.2.0`，Alpha。正式发布快照以 Git tag 和 GitHub Release 为准。
-- 0.2.0 统一了优化、扫参和验证的案例执行流程，补充参数恢复、结果来源与有效性检查、独立 best 保存，以及过孔和 PCB 工作流。
+- 当前版本：`0.2.0`，Alpha。
+- 0.2.0 统一了优化、扫参和验证的案例执行流程，并新增沿指定线条自动布置过孔、从 AEDT 工程导出 Gerber，以及根据 Gerber、Drill 和叠层信息重建 AEDT 模型等 skills。
 - 从旧版升级时，建议保留旧配置和运行目录；字段变化及支持范围见[0.2.0 迁移说明](docs/migration-0.2.0.md)，版本变化见[更新日志](CHANGELOG.md)。
 
 ## 核心功能
 
-- `opt`：参数优化，支持 DE/JADE、CMA-ES、NSGA-II、Bayesian Optimization 和 PSO。
-- `sweep`：支持逐变量扫参（OAT）、笛卡尔积组合（grid）和显式点集（explicit）。
-- `val`：固定参数组合验证，可重新求解，也可只读已有结果。
-- Dashboard：查看运行状态、参数、S 参数和结果 snapshot。
+- 优化（`opt`）：支持 DE/JADE、CMA-ES、NSGA-II、Bayesian Optimization 和 PSO。
+- 扫参（`sweep`）：支持逐变量扫参（OAT）、笛卡尔积组合（grid）和显式点集（explicit）。
+- 单点验证（`val`）：验证一组或多组固定参数，可重新求解，也可只读已有结果。
+- Dashboard：查看运行状态、参数、S 参数和结果快照。
 - 只读预检：获取设计、变量、setup/sweep、对象和可用报告量。
 - 参数与结果核验：检查参数写入/恢复、variation、频率单位、频带覆盖和必需指标。
 - best 保存：按搜索仿真次数保存当前最优模型，结束时独立复验并导出。
@@ -27,7 +27,7 @@
 
 - Python `>=3.11,<3.14`。
 - 推荐使用 `uv` 管理环境。
-- 真实仿真需要已安装并授权的 Ansys Electronics Desktop / HFSS。
+- 需要已安装并授权的 Ansys Electronics Desktop / HFSS。
 - 本版真实验证环境：Windows、AEDT 2023.2、PyAEDT 0.18.1、COM、non-GUI。其他 AEDT 版本、gRPC 和共享桌面复用尚未验证。
 
 ### 从源码安装
@@ -77,15 +77,15 @@ cd my_hfss_project
 在源码仓库或 `scaffold` 创建的目录中打开 Codex，可以直接说：
 
 ```text
-先检查 hfss/patch.aedt，再执行一次单点验证。
-我要对 hfss/patch.aedt 执行一次 sweep 任务。
-我要对 hfss/patch.aedt 执行一次 opt 任务。
+先检查 hfss/patch.aedt，再执行一次单点验证（val）任务。
+我要对 hfss/patch.aedt 执行一次扫参（sweep）任务。
+我要对 hfss/patch.aedt 执行一次优化（opt）任务。
 ```
 
 也可以换成自己的工程路径。如果没有自动匹配 skill，可以显式调用：
 
 ```text
-$hh-sim，我要对 <你的 .aedt 文件路径> 执行一次 opt 任务。
+$hh-sim，我要对 <你的 .aedt 文件路径> 执行一次优化（opt）任务。
 ```
 
 `hh-sim` 会先读取工程信息，只询问仍缺失的参数、范围、目标和预算；已有明确授权可直接复用。启动前汇总具体配置，运行后检查实际结果、恢复和终态。
@@ -140,7 +140,7 @@ uv run python -m optimizer.cli configs/my_val.json
 
 ## 任务类型
 
-### opt
+### 优化（opt）
 
 优化参数建议使用连续范围加量化精度：
 
@@ -150,7 +150,7 @@ uv run python -m optimizer.cli configs/my_val.json
 
 配置 `algorithm` 中的算法、迭代/搜索求解预算；可用带时区的 `optimization.end_at` 限制后续案例启动。时间限制在案例之间检查，不保证强制中断正在进行的求解。
 
-### sweep
+### 扫参（sweep）
 
 - `oat`：逐个扫描变量，其他变量保持基线；默认模式。
 - `grid`：扫描所有变量取值的笛卡尔积。
@@ -158,7 +158,7 @@ uv run python -m optimizer.cli configs/my_val.json
 
 OAT/grid 使用 `study.variables` 的 `name/start/stop/step`；explicit 使用 `study.cases`。`study.max_cases` 限制点数，每个案例完成后恢复基线。示例与规则见[任务参考](docs/agent-reference.md)。
 
-### val
+### 单点验证（val）
 
 固定参数组合不执行搜索：
 
@@ -181,7 +181,7 @@ OAT/grid 使用 `study.variables` 的 `name/start/stop/step`；explicit 使用 `
 
 ## PCB 导出与重建
 
-五项 skills 中的 `hh-via`、`hh-export-pcb` 和 `hh-rebuild-pcb` 分别负责过孔、导出和重建：
+`hh-via` 沿指定线条自动布置过孔，`hh-export-pcb` 从 AEDT 工程导出 PCB 加工包，`hh-rebuild-pcb` 根据加工包重建 AEDT 模型：
 
 ```text
 $hh-via，沿模型中的指定路径创建过孔。
@@ -221,9 +221,9 @@ uv run python -m optimizer.dashboard.serve_dashboard --task-dir <run_dir>
 
 | Skill | 用途 |
 | --- | --- |
-| `hh-sim` | 预检模型，准备并运行 opt/sweep/val |
+| `hh-sim` | 预检模型，准备并运行优化、扫参和单点验证 |
 | `hh-iter` | 分析已完成优化轮次，草拟下一轮配置 |
-| `hh-via` | 沿指定路径创建和核验过孔 |
+| `hh-via` | 沿指定线条自动布置和核验过孔 |
 | `hh-export-pcb` | 导出 Gerber/GKO/Drill 与叠层信息 |
 | `hh-rebuild-pcb` | 按 PCB 加工包重建几何与材料 |
 

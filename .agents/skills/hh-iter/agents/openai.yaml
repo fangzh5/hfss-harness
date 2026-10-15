@@ -1,4 +1,4 @@
 ﻿interface:
   display_name: "HFSS Harness Iter"
-  short_description: "Analyze run logs and draft the next config"
-  default_prompt: "Use $hh-iter to analyze the latest hfss-harness optimization round, summarize parameter sensitivity, and generate the next config."
+  short_description: "分析已完成的优化轮次，草拟下一轮配置"
+  default_prompt: "使用 $hh-iter 分析已完成的优化轮次，总结已测参数与指标的关系，并以核验后的 best 草拟下一轮配置。"

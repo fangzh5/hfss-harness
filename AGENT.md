@@ -9,13 +9,13 @@
 - 默认启动命令：`python optimizer\cli.py <config> --dashboard --dashboard-browser`
 - 静默启动命令：`python optimizer\cli.py <config> --silent --no-dashboard --no-dashboard-browser`
 - 不要使用 `optimizer/main.py` 或 `optimizer/run_optimizer.py` 作为启动入口。
-- 仅看板入口：`python optimizer\dashboard\serve_dashboard.py --task-dir <run_dir>`
+- 仅看板入口：`python -m optimizer.dashboard.serve_dashboard --task-dir <run_dir>`，源码和安装包都适用。
 
 ## 模板分流
 
 - `opt` / 优化：`configs/template_opt.json`
 - `sweep` / 扫参：`configs/template_sweep.json`
-- `val` / 验证：`configs/template_val.json`
+- `val` / 单点验证（一组或多组固定参数）：`configs/template_val.json`
 - `BO` 仍按 `opt` 入口处理，必要时继续从 `configs/template_bo.json` 读取。
 
 ## 约定

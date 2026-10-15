@@ -3,10 +3,10 @@
 `optimizer/modeling/via_creation.py` 提供首次数组创建和精确所有权数组替换事务，`scripts/create_vias_safely.py` 是默认首创工作副本入口。它不调用求解器。
 
 ```powershell
-python scripts/create_vias_safely.py --project hfss/patch.aedt --design base --path-name sidewall --prefix test_via --spacing-mm 0.8 --spacing-rule max --radius via_r --variable via_r=0.2mm --z-start 0mm --height sub_h --color 0 0 255
+python scripts/create_vias_safely.py --project <source.aedt> --design <design> --path-name <path> --prefix <new-prefix> --spacing-mm 0.5 --spacing-rule max --radius 0.1mm --z-start 0mm --height <height-expression> --color 0 0 255
 ```
 
-此示例要求 `test_via_*` 尚不存在。脚本将原工程复制到唯一 `temp/via_<stamp>`，在独立可视会话中操作；计划、位置 CSV、运行记录、原文件副本及核验后模型保存在 `runs/autovia/<task_stamp>`。来源、工作文件与保留产物分开，默认入口不能写回来源。原工程的既有过孔不会按前缀删除。
+将占位符替换为实际工程、设计、路径、新前缀和高度表达式后运行；参数仅作命令示例，不是加工预设。默认首创入口要求该前缀对应的数组尚不存在。脚本将原工程复制到唯一 `temp/via_<stamp>`，在独立可视会话中操作；它与仿真和PCB入口的non-GUI默认值不同。计划、位置 CSV、运行记录、原文件副本及核验后模型保存在 `runs/autovia/<task_stamp>`。默认入口不能写回来源，也不会按前缀删除原工程的既有过孔。
 
 创建步骤：确认工作工程与设计身份；回读原生最终边及其端点、长度和1/4、1/2、3/4采样点；逐边与文件历史唯一匹配，支持直线和固定角度主平面AngularArc，不将曲线当作弦；检查所有孔间净距；用唯一暂存名称创建；回读每根圆柱的包围盒、体积、材质、Solve Inside、颜色与尺寸表达式；全部通过后改为最终名称，检查原有对象并保存。创建、改名、属性核验或保存失败，仅回滚本次操作及已核验归属阵列；回滚失败明确记录并停止。
 
@@ -18,4 +18,4 @@ python scripts/create_vias_safely.py --project hfss/patch.aedt --design base --p
 
 已有数组替换必须传入逐对象的 `owned_existing` 记录，名称必须完整覆盖当前前缀数组，真实几何、属性和创建命令必须匹配。先核验全部新候选，再暂时改名保留旧数组；提交时只清理已登记的旧对象。创建、两阶段改名、核验或保存失败，恢复旧对象；普通全局铜圆柱可按保存的创建表达式重建。CLI使用`--ownership-manifest`指定成功记录。真实直线和固定角度XY圆弧+直线均已通过归属替换/重复执行/故障回滚及保存重开，故障保存范围仅为写盘前返回False。
 
-当前限制：本入口创建实心铜EM圆柱。规划与表达式支持XY/YZ/ZX，但本轮真实创建验收为XY固定角度圆弧+直线，负270度大圆弧仅做原生路径读取；YZ/ZX与闭合圆弧的真实生命周期、其他版本仍待覆盖。独立几何夹具明确关闭自动开放区域；不能按普通实体查询自动RadiatingSurface的材质，也不据本次关闭的夹具宣称该场景已支持。带镀层中空孔壁与CAM钻孔工艺由制造服务负责。旧脚本已迁移到安全入口；`--no-save`为无CAD的历史规划。
+当前限制：本入口创建实心铜EM圆柱。规划与表达式支持XY/YZ/ZX，但真实创建验收为XY固定角度圆弧+直线，负270度大圆弧仅做原生路径读取；YZ/ZX与闭合圆弧的真实生命周期、其他版本尚未验证。独立几何夹具明确关闭自动开放区域；不能按普通实体查询自动RadiatingSurface的材质，也不据此宣称该场景已支持。带镀层中空孔壁与CAM钻孔工艺由制造服务负责。此公共CLI没有 `--no-save` 选项；只做规划时使用 `build_via_plan`，不要运行创建命令。

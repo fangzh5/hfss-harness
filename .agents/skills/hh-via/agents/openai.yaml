@@ -1,4 +1,4 @@
 ﻿interface:
   display_name: "HFSS Harness Via"
-  short_description: "Create and verify parameterized HFSS via arrays safely"
-  default_prompt: "Use $hh-via to plan and verify a parameterized via array in an isolated work model, reuse confirmed inputs, record results in runs/autovia, and follow the requested save/close behavior."
+  short_description: "沿指定线条自动布置并核验参数化过孔"
+  default_prompt: "使用 $hh-via 沿指定线条规划、创建并核验过孔，复用已确认参数，将结果保存在 runs/autovia，并按要求保存或关闭工程。"

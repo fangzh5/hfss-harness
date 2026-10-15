@@ -62,7 +62,7 @@ In particular, distinguish thin metal layer shapes, board-spanning via objects, 
 
 Validate copper-only via layer pairs and all feature/tool references before output. Re-read actual Gerber/Drill, compare final regions and holes, and render from parsed CAM rather than a JSON preview. Drill operations retain layer pair and metallization in file naming/notes and parsed TYPE metadata; no implicit pad or plating dimension is added. Record parser version, coordinate quantization, curve/comparison tolerance and file hashes.
 
-Select an implementation that supports the inspected model. The legacy `scripts/export_hfss_fabrication_package.py` contains a model-specific default project/design, heuristic via classification and a shared assumed drill diameter. Do not launch it with defaults or treat its output as verified under the actual-diameter rule. Explicitly supply project/design/output, then check every object role, layer pair and measured drill size; refuse the route if it cannot represent the current inputs. Project-local repair scripts do not extend the public support boundary.
+Use the public native exporter for the declared subset. Explicitly supply the source/design and resolve every object role, layer pair and measured drill size before accepting a package. Private or historical helpers are not distributed and do not extend the public support boundary.
 
 ```powershell
 python -m optimizer.fabrication.native_export --help

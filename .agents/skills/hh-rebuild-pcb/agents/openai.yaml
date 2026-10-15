@@ -1,4 +1,4 @@
 ﻿interface:
   display_name: "HFSS Harness Rebuild PCB"
   short_description: "从 Gerber、GKO、Drill 和叠层重建 AEDT PCB 模型"
-  default_prompt: "Use $hh-rebuild-pcb to reconstruct or audit an HFSS/AEDT PCB verification model from copper Gerber, closed GKO board profile, drill, and stackup data."
+  default_prompt: "使用 $hh-rebuild-pcb 根据 Gerber、GKO、Drill 和叠层信息重建或核验 AEDT 模型的几何与材料，缺少关键输入时先向我确认。"

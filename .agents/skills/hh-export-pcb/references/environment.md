@@ -7,15 +7,17 @@ Use this reference when setting up a new machine, documenting prerequisites, or 
 ### Required for file generation
 
 - Python supported by the repository.
-- Repository source code and its Python dependencies.
-- Ability to read the source `.aedt` file, either through AEDT/HFSS automation or through text/archive parsing used by the current workflow.
+- Source checkout or installed package with the `hfss` and `cam` extras.
+- Licensed AEDT/HFSS access for the public native exporter, which reads final modeler geometry from a protected project copy.
 - Write access to the chosen output directory.
 
-Typical Python packages used by this workflow family include:
+The extras provide the current runtime dependencies:
 
-- `pytest` for verification.
-- `numpy` for geometry/raster operations.
-- `matplotlib` when using `matplotlib.path.Path` for point-in-polygon checks.
+- PyAEDT for AEDT automation.
+- Gerbonara and Shapely for actual CAM parsing and geometry.
+- NumPy and Matplotlib for numeric checks and previews.
+
+`pytest` is a developer dependency, not a requirement for users running the installed workflow.
 
 Install dependencies according to the repository's existing environment policy. Do not introduce a second unmanaged environment if the repo already has one.
 
@@ -37,7 +39,7 @@ Acceptable alternatives:
 
 Install and license Ansys Electronics Desktop / HFSS when the workflow must launch AEDT, query modeler objects through the API, or export geometry through AEDT automation.
 
-If the workflow only parses existing `.aedt` text/archive content and the required geometry is accessible, AEDT may not be required for that specific run. State this distinction clearly when documenting setup.
+Reading an existing fabrication package with `cam_import` does not launch AEDT; extracting fabrication geometry from `.aedt` with `native_export` does. Historical text-parsing helpers are not public export entrypoints.
 
 ### Optional for PCB review source
 
@@ -64,7 +66,7 @@ Altium Designer is optional when the user or vendor wants AD/CAM inspection, but
 
 When sharing this skill with another user or machine, document two modes:
 
-1. Minimal fabrication mode: Python environment + Gerber viewer + source `.aedt` that can be parsed/exported.
-2. Full review mode: minimal mode + KiCad + optional AEDT/HFSS automation + optional Altium Designer.
+1. Native export: Python with `hfss`/`cam` extras, licensed AEDT/HFSS and the source `.aedt`; use a CAM viewer for visual review.
+2. Existing-package inspection: Python with `cam`, the actual Gerber/Drill/stackup files and a CAM viewer; no AEDT launch is needed until reconstruction.
 
 Do not require Altium Designer just to manufacture an HFSS-derived antenna board if the Gerber, Drill, and stackup notes are complete.

@@ -41,7 +41,7 @@ description: Use when creating, updating, or testing HFSS/AEDT via arrays along 
 - 安全替换：--ownership-manifest <successful-manifest.json>；完整归属与实时观测不一致会拒绝。
 - 工作副本赋值：--variable name=value；再生验证：--check-variable name=value。CLI赋值目前只支持局部变量；原生尺寸校验可读取工程变量。
 - --close-project只关闭工作工程，不追加保存，不退出借用的AEDT或其他工程。默认保留工作工程供检查；用户要求保存/关闭/不保存时遵循已有指令。
-- 旧create_vias_from_path_config.py改走安全副本入口；--no-save只生成标记为文件历史、未经CAD核验的规划，不连接AEDT。旧CSV/JSON输出必须位于runs且不得覆盖。已有阵列更新使用安全入口及完整归属记录。
+- 只做规划时使用 `build_via_plan`，不启动创建命令；公开CLI没有 `--no-save` 选项。已有阵列更新使用安全入口及完整归属记录。
 - 一次性案例脚本存入runs/autovia/scripts，调试脚本存入runs/autovia/debug；通用逻辑留在optimizer/modeling和长期scripts。
 - CSV独占创建，记录路径长度、标称/实际沿段间距、真实XYZ、路径Z和孔心距；保留来源快照、计划摘要、journal、属性/几何观测和保存模型hash。
 

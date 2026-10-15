@@ -1,4 +1,4 @@
 ﻿interface:
   display_name: "HFSS Harness Export PCB"
-  short_description: "从 AEDT 导出铜层 Gerber、GKO 板框和钻孔文件"
-  default_prompt: "Use $hh-export-pcb to export or audit an HFSS/AEDT board as copper Gerber, a closed GKO board profile, metallized drill files with explicit annotation overrides, stackup notes, and optional PCB review source."
+  short_description: "从 AEDT 导出 Gerber、GKO、Drill 和叠层信息"
+  default_prompt: "使用 $hh-export-pcb 从 AEDT 工程导出或核验铜层 Gerber、介质外框 GKO、Drill 和叠层信息；复用已确认的层角色与孔层对，明确标注优先。"
